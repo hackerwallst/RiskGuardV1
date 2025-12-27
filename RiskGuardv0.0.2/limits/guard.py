@@ -225,6 +225,79 @@ def close_position_full(ticket: int, symbol: str, side: str, volume: float,
 
 
 # ==================================
+# Ajuste SL/TP (TRADE_ACTION_SLTP)
+# ==================================
+def modify_position_sltp(ticket: int, symbol: str, sl: Optional[float], tp: Optional[float],
+                         comment: str = "RG SLTP") -> Tuple[bool, Dict[str, Any]]:
+    """
+    Modifica SL/TP de uma posição existente.
+
+    - sl/tp podem ser None (interpreta como 0.0 no request).
+    - Se falhar por AutoTrading OFF → tenta toggle ON → aplica → toggle OFF (mesma lógica do close).
+    """
+    try:
+        _symbol_ensure_visible(symbol)
+        info = mt5.symbol_info(symbol)
+        digits = int(info.digits) if info else 5
+
+        sl_v = 0.0 if sl in (None, 0, 0.0) else float(round(float(sl), digits))
+        tp_v = 0.0 if tp in (None, 0, 0.0) else float(round(float(tp), digits))
+
+        def _req() -> Dict[str, Any]:
+            return {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "symbol": symbol,
+                "position": int(ticket),
+                "sl": float(sl_v),
+                "tp": float(tp_v),
+                "comment": _safe_comment(comment),
+            }
+
+        result = mt5.order_send(_req())
+        payload = {
+            "request": _req(),
+            "result": None if result is None else {
+                "retcode": result.retcode,
+                "comment": getattr(result, "comment", ""),
+                "order": getattr(result, "order", 0),
+                "deal": getattr(result, "deal", 0),
+            },
+            "last_error": mt5.last_error(),
+        }
+        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+            return True, {"mode": "api", **payload}
+
+        if not _is_autotrading_disabled(payload):
+            return False, {"mode": "api", **payload}
+
+        toggled_on = ensure_autotrading_on()
+        time.sleep(0.50)
+
+        result2 = mt5.order_send(_req())
+        payload2 = {
+            "request": _req(),
+            "result": None if result2 is None else {
+                "retcode": result2.retcode,
+                "comment": getattr(result2, "comment", ""),
+                "order": getattr(result2, "order", 0),
+                "deal": getattr(result2, "deal", 0),
+            },
+            "last_error": mt5.last_error(),
+        }
+        time.sleep(0.50)
+
+        ensure_autotrading_off()
+        time.sleep(0.40)
+
+        ok2 = bool(result2 and result2.retcode == mt5.TRADE_RETCODE_DONE)
+        return (True, {"mode": "api+toggle_hotkey", "uia_on": toggled_on, **payload2}) if ok2 \
+               else (False, {"mode": "api+toggle_hotkey", "uia_on": toggled_on, **payload2})
+
+    except Exception as e:
+        return False, {"error": repr(e), "ticket": ticket, "symbol": symbol, "sl": sl, "tp": tp}
+
+
+# ==================================
 # Detectar estado de BLOQUEIO ativo
 # ==================================
 def _block_active() -> Dict[str, Any]:

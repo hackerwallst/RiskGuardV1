@@ -1,0 +1,26 @@
+# Secrets / config local
+RiskGuardv0.0.2/config.txt
+
+# State / cache (runtime)
+RiskGuardv0.0.2/.rg_state.json
+RiskGuardv0.0.2/.rg_pertrade_interactive.json
+RiskGuardv0.0.2/.rg_terminal.json
+RiskGuardv0.0.2/.guard_lock
+RiskGuardv0.0.2/notify/.notify_last.txt
+RiskGuardv0.0.2/limits/.guard_breach_cache.json
+RiskGuardv0.0.2/limits/.rg_risk_block.json
+RiskGuardv0.0.2/news/ff_cache.json
+
+# Reports (outputs)
+RiskGuardv0.0.2/reports/.monthly.flag
+RiskGuardv0.0.2/reports/*.html
+RiskGuardv0.0.2/reports/*.pdf
+RiskGuardv0.0.2/reports/*.csv
+RiskGuardv0.0.2/reports/*.png
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store

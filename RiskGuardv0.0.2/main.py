@@ -32,6 +32,7 @@ from limits.limits import enforce_aggregate_risk, risk_block_status
 from logger import log_event
 from notify import send_alert, set_ident_from_snapshot
 from rg_config import get_bool, get_float, get_int, get_optional_float, get_optional_int
+from trade_notify import sync_and_notify_trades
 
 
 # Opcionais (carregar sem quebrar)
@@ -39,6 +40,11 @@ try:
     from limits.guard import close_position_full  # fará o toggle neural internamente
 except Exception:
     close_position_full = None
+
+try:
+    from limits.per_trade_interactive import enforce_per_trade_interactive_sl
+except Exception:
+    enforce_per_trade_interactive_sl = None
 
 try:
     from limits.dd_kill import enforce_drawdown
@@ -70,6 +76,9 @@ SNAPSHOT_MAX_FAILS_BEFORE_RECONNECT = 6   # após X falhas seguidas, tenta recon
 CONNECT_BACKOFF_MAX = 60                  # backoff máx em segs
 
 PERTRADE_MAX_RISK = get_float("PERTRADE_MAX_RISK", 1.0)          # %
+PERTRADE_INTERACTIVE = get_bool("PERTRADE_INTERACTIVE", False)
+PERTRADE_INTERACTIVE_TIMEOUT_MIN = get_int("PERTRADE_INTERACTIVE_TIMEOUT_MIN", 15)
+TRADE_NOTIFICATIONS = get_bool("TRADE_NOTIFICATIONS", False)
 AGGREGATE_MAX_RISK = get_float("AGGREGATE_MAX_RISK", 5.0)         # %
 AGGREGATE_MAX_ATTEMPTS = get_int("AGGREGATE_MAX_ATTEMPTS", 3)     # segue monitorando tentativas (não toca no botão)
 
@@ -346,7 +355,7 @@ def main():
     except Exception:
         pass
 
-    state = _load_json(STATE_FILE, {"tickets": []})
+    state = _load_json(STATE_FILE, {})
     last_calendar_df, last_calendar_ts = None, 0.0
     snapshot_fails = 0
 
@@ -386,9 +395,20 @@ def main():
             eq = _fmt_money(acct.get("equity"))
             positions = snap.get("positions") or []
             tickets = [int(p.get("ticket", 0)) for p in positions if p.get("ticket") is not None]
-            prev = set(state.get("tickets", []))
-            curr = set(tickets)
-            new_tickets = [t for t in curr if t not in prev]
+
+            # Notificações de trade open/close + baseline (primeiro loop é silencioso)
+            try:
+                state, trade_rep = sync_and_notify_trades(
+                    reader,
+                    snapshot=snap,
+                    state=state,
+                    pertrade_limit_pct=PERTRADE_MAX_RISK,
+                    enabled=TRADE_NOTIFICATIONS,
+                )
+                new_tickets = list(trade_rep.get("new_tickets") or [])
+            except Exception as e:
+                log_event("ERROR", {"err": repr(e)}, {"module": "trade_notify"})
+                new_tickets = []
 
             # Heartbeat
             print(f"[{datetime.now().strftime('%H:%M:%S')}] Equity={eq} | Posições={len(tickets)}", flush=True)
@@ -396,14 +416,28 @@ def main():
 
             # 1) Per-trade (1% + SL)
             try:
-                pt_actions = enforce_per_trade_inline(reader, PERTRADE_MAX_RISK)
-                if pt_actions:
-                    lines = []
-                    for a in pt_actions:
-                        motivo = "SEM SL" if a.get("missing_sl") else f"risco {_fmt_pct(a.get('risk_pct'))}"
-                        status = "✅" if a.get("ok") else "❌"
-                        lines.append(f"{status} {a.get('symbol')} #{a.get('ticket')} — {motivo}")
-                    _rate_limited_alert("PER-TRADE", lines)
+                if PERTRADE_INTERACTIVE and enforce_per_trade_interactive_sl:
+                    pt_rep = enforce_per_trade_interactive_sl(
+                        reader,
+                        max_risk_pct=PERTRADE_MAX_RISK,
+                        timeout_minutes=PERTRADE_INTERACTIVE_TIMEOUT_MIN,
+                        snapshot=snap,
+                    )
+                    if pt_rep.get("adjust_failed"):
+                        print(f"[⚠️] PER-TRADE: ajuste SL falhou em {len(pt_rep['adjust_failed'])} posição(ões).",
+                              flush=True)
+                    if pt_rep.get("adjusted"):
+                        print(f"[🛡️] PER-TRADE: SL ajustado em {len(pt_rep['adjusted'])} posição(ões).",
+                              flush=True)
+                else:
+                    pt_actions = enforce_per_trade_inline(reader, PERTRADE_MAX_RISK)
+                    if pt_actions:
+                        lines = []
+                        for a in pt_actions:
+                            motivo = "SEM SL" if a.get("missing_sl") else f"risco {_fmt_pct(a.get('risk_pct'))}"
+                            status = "✅" if a.get("ok") else "❌"
+                            lines.append(f"{status} {a.get('symbol')} #{a.get('ticket')} — {motivo}")
+                        _rate_limited_alert("PER-TRADE", lines)
             except Exception as e:
                 log_event("ERROR", {"err": repr(e)}, {"module":"per-trade"})
 
@@ -499,12 +533,6 @@ def main():
             _once_monthly_generate_and_send(reader)
 
             # Persistir estado
-            prev = set(state.get("tickets", []))
-            curr = set(tickets)
-            new_tickets = [t for t in curr if t not in prev]
-
-            # ✅ ATUALIZA AQUI (antes de usar em news_window)
-            state["tickets"] = tickets
             _save_json(STATE_FILE, state)
             
 

@@ -8,4 +8,6 @@ from .Notify import (
     notify_report,
     send_document,
     send_event,
+    telegram_poll_chat_texts,
+    telegram_poll_chat_messages,
 )

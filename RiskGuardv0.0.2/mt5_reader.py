@@ -203,6 +203,8 @@ class RiskGuardMT5Reader:
             open_time = datetime.fromtimestamp(p.time, tz=timezone.utc)
             open_price = float(p.price_open)
             volume = float(p.volume)
+            magic = int(getattr(p, "magic", 0) or 0)
+            comment = str(getattr(p, "comment", "") or "")
             sl = float(p.sl) if p.sl not in (None, 0.0) else None
             tp = float(p.tp) if p.tp not in (None, 0.0) else None
 
@@ -240,6 +242,9 @@ class RiskGuardMT5Reader:
                 "symbol": symbol,
                 "type": side,
                 "volume": volume,
+                "magic": magic,
+                "comment": comment,
+                "open_time_epoch": int(getattr(p, "time", 0) or 0),
                 "open_time": _to_iso(open_time),
                 "open_price": open_price,
                 "sl": sl,

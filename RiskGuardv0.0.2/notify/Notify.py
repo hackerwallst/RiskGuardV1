@@ -98,6 +98,82 @@ def send_alert(title: str, lines: list[str]) -> bool:
     msg = header + f"📣 <b>{title}</b>\n" + "\n".join(lines)
     return _send_text(msg)
 
+
+# ---------- Inbox (getUpdates) ----------
+def telegram_poll_chat_messages(update_offset: Optional[int] = None, timeout: int = 0) -> tuple[list[Dict[str, Any]], Optional[int]]:
+    """
+    Lê mensagens do chat configurado via getUpdates.
+    Retorna (messages, next_offset). Use next_offset para não reprocessar updates antigos.
+
+    Cada item em messages possui (quando disponível):
+      - text (str)
+      - date (int epoch seconds, UTC)
+      - update_id (int)
+      - message_id (int)
+      - from_is_bot (bool)
+    """
+    if not _ensure_telegram_configured():
+        return [], update_offset
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+    params: Dict[str, Any] = {"timeout": int(timeout)}
+    if update_offset is not None:
+        params["offset"] = int(update_offset)
+
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            print("[notify] getUpdates falha:", r.status_code, r.text[:200])
+            return [], update_offset
+        data = r.json()
+        if not isinstance(data, dict) or not data.get("ok"):
+            return [], update_offset
+        updates = data.get("result") or []
+    except Exception as e:
+        print("[notify] getUpdates exceção:", repr(e))
+        return [], update_offset
+
+    messages: list[Dict[str, Any]] = []
+    next_offset = update_offset
+
+    for u in updates:
+        try:
+            upd_id = u.get("update_id")
+            if isinstance(upd_id, int):
+                next_offset = max(next_offset or 0, upd_id + 1)
+
+            msg = u.get("message") or u.get("edited_message")
+            if not isinstance(msg, dict):
+                continue
+            chat = msg.get("chat") or {}
+            chat_id = chat.get("id")
+            if str(chat_id) != str(CHAT_ID):
+                continue
+
+            text = (msg.get("text") or "").strip()
+            if not text:
+                continue
+
+            frm = msg.get("from") or {}
+            messages.append({
+                "text": text,
+                "date": msg.get("date"),
+                "update_id": upd_id,
+                "message_id": msg.get("message_id"),
+                "from_is_bot": bool(frm.get("is_bot", False)),
+            })
+        except Exception:
+            continue
+
+    return messages, next_offset
+
+
+def telegram_poll_chat_texts(update_offset: Optional[int] = None, timeout: int = 0) -> tuple[list[str], Optional[int]]:
+    """Compat: retorna só os textos (lista[str])."""
+    msgs, next_offset = telegram_poll_chat_messages(update_offset=update_offset, timeout=timeout)
+    texts = [m.get("text") for m in msgs if isinstance(m, dict) and m.get("text")]
+    return texts, next_offset
+
 # ---------- Notificações por tipo ----------
 def notify_per_trade(rep: Dict[str, Any]) -> None:
     for v in rep.get("violations", []):
