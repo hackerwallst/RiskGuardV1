@@ -1,14 +1,15 @@
-param(
-    [string]$AppDir = (Resolve-Path $PSScriptRoot).Path,
-    [string]$VenvDir = "",
-    [string]$Requirements = "",
-    [string]$LogFile = "",
-    [string]$PythonVersion = "3.10.11",
-    [ValidateSet("amd64")][string]$PythonArch = "amd64",
-    [switch]$InstallAllUsers,
-    [switch]$SkipHealthCheck,
-    [switch]$AllowUnpinned
-)
+	param(
+	    [string]$AppDir = (Resolve-Path $PSScriptRoot).Path,
+	    [string]$VenvDir = "",
+	    [string]$Requirements = "",
+	    [string]$LogFile = "",
+	    [string]$PythonVersion = "3.10.11",
+	    [ValidateSet("amd64")][string]$PythonArch = "amd64",
+	    [switch]$InstallAllUsers,
+	    [switch]$SkipHealthCheck,
+	    [switch]$SkipMT5Wizard,
+	    [switch]$AllowUnpinned
+	)
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
@@ -20,15 +21,17 @@ if ([string]::IsNullOrWhiteSpace($VenvDir)) {
 if ([string]::IsNullOrWhiteSpace($Requirements)) {
     $Requirements = Join-Path $AppDir "requirements.txt"
 }
-if ([string]::IsNullOrWhiteSpace($LogFile)) {
-    $LogFile = Join-Path $AppDir "logs\setup.log"
-}
+	if ([string]::IsNullOrWhiteSpace($LogFile)) {
+	    $LogFile = Join-Path $AppDir "logs\setup.log"
+	}
 
-function Write-Log {
-    param([string]$Message)
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $line = "$timestamp - $Message"
-    Write-Output $line
+	$MT5DownloadUrl = "https://www.metatrader5.com/pt/download"
+
+	function Write-Log {
+	    param([string]$Message)
+	    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+	    $line = "$timestamp - $Message"
+	    Write-Output $line
     $logDir = Split-Path -Parent $LogFile
     if (-not (Test-Path $logDir)) {
         New-Item -ItemType Directory -Path $logDir -Force | Out-Null
@@ -111,12 +114,12 @@ function Find-Python {
     return $null
 }
 
-function Resolve-InstalledPython {
-    param(
-        [string]$PreferredPath,
-        [string]$TargetVersion,
-        [switch]$AllUsers
-    )
+	function Resolve-InstalledPython {
+	    param(
+	        [string]$PreferredPath,
+	        [string]$TargetVersion,
+	        [switch]$AllUsers
+	    )
 
     if ($PreferredPath -and (Test-Path $PreferredPath)) {
         return $PreferredPath
@@ -160,11 +163,219 @@ function Resolve-InstalledPython {
         }
     }
 
-    return $best
-}
+	    return $best
+	}
 
-try {
-    Write-Log "Setup started."
+	function Get-ConfiguredMT5Terminal {
+	    param([string]$ConfigPath)
+	    if (-not (Test-Path -LiteralPath $ConfigPath)) {
+	        return $null
+	    }
+	    try {
+	        $cfg = Get-Content -Raw -Path $ConfigPath -ErrorAction Stop | ConvertFrom-Json
+	    } catch {
+	        return $null
+	    }
+	    $path = $cfg.terminal_path
+	    if ([string]::IsNullOrWhiteSpace($path)) {
+	        return $null
+	    }
+	    try {
+	        if (Test-Path -LiteralPath $path) {
+	            return $path
+	        }
+	    } catch {
+	    }
+	    return $null
+	}
+
+	function Save-MT5TerminalConfig {
+	    param(
+	        [string]$ConfigPath,
+	        [string]$TerminalPath
+	    )
+	    $payload = @{ terminal_path = $TerminalPath }
+	    $json = $payload | ConvertTo-Json -Depth 4
+	    Set-Content -Path $ConfigPath -Value $json -Encoding UTF8
+	}
+
+	function Find-MT5Terminals {
+	    param([int]$MaxResults = 25)
+	    $found = New-Object System.Collections.Generic.List[string]
+	    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+
+	    function Add-FoundPath {
+	        param([string]$Path)
+	        if ([string]::IsNullOrWhiteSpace($Path)) { return }
+	        try {
+	            if (-not (Test-Path -LiteralPath $Path)) { return }
+	        } catch {
+	            return
+	        }
+	        if ($seen.Add($Path)) {
+	            [void]$found.Add($Path)
+	        }
+	    }
+
+	    $candidates = @(
+	        "C:\Program Files\MetaTrader 5\terminal64.exe",
+	        "C:\Program Files (x86)\MetaTrader 5\terminal64.exe",
+	        "C:\Program Files\XM Global MT5\terminal64.exe",
+	        "C:\Program Files\MetaQuotes\MetaTrader 5\terminal64.exe"
+	    )
+	    foreach ($p in $candidates) {
+	        Add-FoundPath -Path $p
+	        if ($found.Count -ge $MaxResults) { return ,$found.ToArray() }
+	    }
+
+	    foreach ($base in @($env:APPDATA, $env:LOCALAPPDATA, $env:PROGRAMDATA)) {
+	        if ([string]::IsNullOrWhiteSpace($base)) { continue }
+	        $terminalRoot = Join-Path $base "MetaQuotes\Terminal"
+	        if (-not (Test-Path -LiteralPath $terminalRoot)) { continue }
+	        try {
+	            foreach ($dir in Get-ChildItem -Path $terminalRoot -Directory -ErrorAction SilentlyContinue) {
+	                Add-FoundPath -Path (Join-Path $dir.FullName "terminal64.exe")
+	                if ($found.Count -ge $MaxResults) { return ,$found.ToArray() }
+	            }
+	        } catch {
+	        }
+	    }
+
+	    $programRoots = @($env:ProgramW6432, $env:ProgramFiles, ${env:ProgramFiles(x86)}) |
+	        Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
+	        Select-Object -Unique
+
+	    foreach ($root in $programRoots) {
+	        try {
+	            foreach ($dir in Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue) {
+	                Add-FoundPath -Path (Join-Path $dir.FullName "terminal64.exe")
+	                if ($found.Count -ge $MaxResults) { return ,$found.ToArray() }
+
+	                $name = ([string]$dir.Name).ToLowerInvariant()
+	                if ($name -match "metatrader|mt5|metaquotes") {
+	                    foreach ($sub in Get-ChildItem -Path $dir.FullName -Directory -ErrorAction SilentlyContinue) {
+	                        Add-FoundPath -Path (Join-Path $sub.FullName "terminal64.exe")
+	                        if ($found.Count -ge $MaxResults) { return ,$found.ToArray() }
+	                    }
+	                }
+	            }
+	        } catch {
+	        }
+	        if ($found.Count -ge $MaxResults) { break }
+	    }
+
+	    return ,$found.ToArray()
+	}
+
+	function Configure-MT5TerminalWizard {
+	    param(
+	        [string]$AppDir
+	    )
+
+	    if ($env:OS -ne "Windows_NT") {
+	        Write-Log "Skipping MT5 wizard (not Windows)."
+	        return
+	    }
+
+	    $cfgPath = Join-Path $AppDir ".rg_terminal.json"
+	    $configured = Get-ConfiguredMT5Terminal -ConfigPath $cfgPath
+	    if ($configured) {
+	        Write-Log "MT5 terminal already configured: $configured"
+	        return
+	    }
+
+	    $interactive = $true
+	    try { $interactive = -not [Console]::IsInputRedirected } catch { $interactive = $false }
+
+	    $found = @(Find-MT5Terminals -MaxResults 25)
+	    if ($found.Count -gt 0) {
+	        Write-Log ("Detected MT5 terminals: " + ($found -join " | "))
+	        if (-not $interactive) {
+	            $pick = $found[0]
+	            Save-MT5TerminalConfig -ConfigPath $cfgPath -TerminalPath $pick
+	            Write-Log "Saved MT5 terminal_path to $cfgPath"
+	            return
+	        }
+
+	        while ($true) {
+	            Write-Output ""
+	            Write-Output "MetaTrader 5 detectado. Selecione o terminal64.exe para usar:"
+	            for ($i = 0; $i -lt $found.Count; $i++) {
+	                Write-Output ("  [{0}] {1}" -f ($i + 1), $found[$i])
+	            }
+	            Write-Output "  [M] Digitar caminho manual"
+	            Write-Output "  [D] Abrir página de download do MT5"
+	            Write-Output "  [S] Pular (configurar depois)"
+
+	            $choice = (Read-Host "Opção").Trim()
+	            if ([string]::IsNullOrWhiteSpace($choice)) { $choice = "1" }
+	            $lower = $choice.ToLowerInvariant()
+
+	            if ($lower -eq "s") {
+	                Write-Log "Skipping MT5 terminal configuration by user choice."
+	                return
+	            }
+	            if ($lower -eq "d") {
+	                try { Start-Process $MT5DownloadUrl | Out-Null } catch { }
+	                continue
+	            }
+	            if ($lower -eq "m") {
+	                $entered = (Read-Host "Caminho completo para terminal64.exe").Trim().Trim('"')
+	                if (-not [string]::IsNullOrWhiteSpace($entered) -and (Test-Path -LiteralPath $entered)) {
+	                    Save-MT5TerminalConfig -ConfigPath $cfgPath -TerminalPath $entered
+	                    Write-Log "Saved MT5 terminal_path to $cfgPath"
+	                    return
+	                }
+	                Write-Output "Caminho não encontrado. Tente novamente."
+	                continue
+	            }
+
+	            $idx = 0
+	            if ([int]::TryParse($choice, [ref]$idx) -and $idx -ge 1 -and $idx -le $found.Count) {
+	                $pick = $found[$idx - 1]
+	                Save-MT5TerminalConfig -ConfigPath $cfgPath -TerminalPath $pick
+	                Write-Log "Saved MT5 terminal_path to $cfgPath"
+	                return
+	            }
+
+	            Write-Output "Opção inválida."
+	        }
+	    }
+
+	    Write-Log "MT5 terminal64.exe not found. Install MetaTrader 5: $MT5DownloadUrl"
+	    if (-not $interactive) {
+	        return
+	    }
+
+	    while ($true) {
+	        Write-Output ""
+	        Write-Output "MetaTrader 5 não encontrado. Opções:"
+	        Write-Output "  [D] Abrir página de download do MT5"
+	        Write-Output "  [M] Digitar caminho manual"
+	        Write-Output "  [S] Pular (instalar depois)"
+
+	        $choice = (Read-Host "Opção").Trim().ToLowerInvariant()
+	        if ($choice -eq "s") { return }
+	        if ($choice -eq "d") {
+	            try { Start-Process $MT5DownloadUrl | Out-Null } catch { }
+	            continue
+	        }
+	        if ($choice -eq "m" -or $choice -eq "") {
+	            $entered = (Read-Host "Caminho completo para terminal64.exe").Trim().Trim('"')
+	            if (-not [string]::IsNullOrWhiteSpace($entered) -and (Test-Path -LiteralPath $entered)) {
+	                Save-MT5TerminalConfig -ConfigPath $cfgPath -TerminalPath $entered
+	                Write-Log "Saved MT5 terminal_path to $cfgPath"
+	                return
+	            }
+	            Write-Output "Caminho não encontrado. Tente novamente."
+	            continue
+	        }
+	        Write-Output "Opção inválida."
+	    }
+	}
+
+	try {
+	    Write-Log "Setup started."
 
     if (-not [Environment]::Is64BitOperatingSystem) {
         Fail "Windows 64-bit is required."
@@ -177,13 +388,20 @@ try {
         Fail "AppDir not found: $AppDir"
     }
 
-    if (-not (Test-Path $Requirements)) {
-        Fail "requirements.txt not found at $Requirements"
-    }
+	    if (-not (Test-Path $Requirements)) {
+	        Fail "requirements.txt not found at $Requirements"
+	    }
 
-    $pythonUrl = "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-$PythonArch.exe"
-    Write-Log "Checking internet access: $pythonUrl"
-    Invoke-WebRequest -Uri $pythonUrl -Method Head -UseBasicParsing -TimeoutSec 15 | Out-Null
+	    $configExample = Join-Path $AppDir "config.example.txt"
+	    $configTxt = Join-Path $AppDir "config.txt"
+	    if (-not (Test-Path -LiteralPath $configTxt) -and (Test-Path -LiteralPath $configExample)) {
+	        Copy-Item -Path $configExample -Destination $configTxt -Force
+	        Write-Log "Created config.txt from config.example.txt"
+	    }
+
+	    $pythonUrl = "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-$PythonArch.exe"
+	    Write-Log "Checking internet access: $pythonUrl"
+	    Invoke-WebRequest -Uri $pythonUrl -Method Head -UseBasicParsing -TimeoutSec 15 | Out-Null
 
     if (-not $AllowUnpinned) {
         Assert-RequirementsPinned -Path $Requirements
@@ -295,23 +513,33 @@ try {
         }
     }
 
-    if (-not $SkipHealthCheck) {
-        $healthCheck = Join-Path $AppDir "health_check.py"
-        if (Test-Path $healthCheck) {
-            $logsDir = Join-Path $AppDir "logs"
-            Write-Log "Running health_check.py"
-            & $venvPython $healthCheck --app-dir "$AppDir" --logs-dir "$logsDir" --log-file "$LogFile"
-            if ($LASTEXITCODE -ne 0) {
-                Fail "health_check.py failed with exit code $LASTEXITCODE"
-            }
-        } else {
-            Write-Log "health_check.py not found. Skipping."
-        }
-    }
+	    if (-not $SkipHealthCheck) {
+	        $healthCheck = Join-Path $AppDir "health_check.py"
+	        if (Test-Path $healthCheck) {
+	            $logsDir = Join-Path $AppDir "logs"
+	            Write-Log "Running health_check.py"
+	            & $venvPython $healthCheck --app-dir "$AppDir" --logs-dir "$logsDir" --log-file "$LogFile"
+	            if ($LASTEXITCODE -ne 0) {
+	                Fail "health_check.py failed with exit code $LASTEXITCODE"
+	            }
+	        } else {
+	            Write-Log "health_check.py not found. Skipping."
+	        }
+	    }
 
-    Write-Log "Setup completed successfully."
-    exit 0
-} catch {
+	    if (-not $SkipMT5Wizard) {
+	        try {
+	            Configure-MT5TerminalWizard -AppDir $AppDir
+	        } catch {
+	            Write-Log "MT5 wizard failed (non-fatal): $($_.Exception.Message)"
+	        }
+	    } else {
+	        Write-Log "Skipping MT5 terminal wizard."
+	    }
+
+	    Write-Log "Setup completed successfully."
+	    exit 0
+	} catch {
     Write-Log "Setup failed: $($_.Exception.Message)"
     exit 1
 }

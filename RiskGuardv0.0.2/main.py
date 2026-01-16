@@ -1,6 +1,6 @@
 # main.py — RiskGuard (Modo Deus Neural) — bloqueio lógico, sem tocar no botão
 from __future__ import annotations
-import os, sys, time, json, random
+import os, sys, time, json, random, webbrowser
 from datetime import datetime, timedelta, timezone, date
 from typing import Optional, List, Dict, Any
 
@@ -61,8 +61,116 @@ CANDIDATE_TERMINALS = [
     r"C:\Program Files\MetaTrader 5\terminal64.exe",
     r"C:\Program Files\XM Global MT5\terminal64.exe",
     r"C:\Program Files (x86)\MetaTrader 5\terminal64.exe",
-    r"C:\Users\Administrator\AppData\Roaming\MetaQuotes\Terminal\terminal64.exe",
 ]
+MT5_DOWNLOAD_URL = "https://www.metatrader5.com/pt/download"
+
+def _walk_find_terminal64(root: str, max_depth: int = 3, max_results: int = 25) -> List[str]:
+    """
+    Busca terminal64.exe recursivamente (com limite de profundidade) para evitar varredura infinita.
+    """
+    results: List[str] = []
+    if not root or not os.path.isdir(root):
+        return results
+
+    prune = {
+        "mql5", "profiles", "tester", "history", "logs", "bases",
+        "config", "cache", "images", "sounds", "scripts", "experts", "indicators",
+    }
+
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            if "terminal64.exe" in filenames:
+                results.append(os.path.join(dirpath, "terminal64.exe"))
+                if len(results) >= max_results:
+                    return results
+
+            # Limita profundidade relativa ao root
+            try:
+                rel = os.path.relpath(dirpath, root)
+                depth = 0 if rel == "." else (rel.count(os.sep) + 1)
+            except Exception:
+                depth = 0
+            if depth >= max_depth:
+                dirnames[:] = []
+                continue
+
+            # Prune de pastas grandes que não costumam conter o executável
+            dirnames[:] = [d for d in dirnames if d.lower() not in prune]
+    except Exception:
+        return results
+
+    return results
+
+def _scan_mt5_terminals(max_results: int = 25) -> List[str]:
+    """
+    Varredura "rápida" por instalações de MT5 em locais comuns (Program Files e AppData).
+    Retorna caminhos para terminal64.exe encontrados.
+    """
+    if os.name != "nt":
+        return []
+
+    found: List[str] = []
+    found_keys = set()
+
+    def add(path: str):
+        if not path:
+            return
+        try:
+            if not os.path.exists(path):
+                return
+        except Exception:
+            return
+        key = os.path.normcase(path)
+        if key in found_keys:
+            return
+        found_keys.add(key)
+        found.append(path)
+
+    # Data folders (onde muitos terminais deixam um terminal64.exe "launcher")
+    for env_name in ("APPDATA", "LOCALAPPDATA", "PROGRAMDATA"):
+        base = os.environ.get(env_name)
+        if not base:
+            continue
+        terminal_root = os.path.join(base, "MetaQuotes", "Terminal")
+        if not os.path.isdir(terminal_root):
+            continue
+        try:
+            for entry in os.scandir(terminal_root):
+                if not entry.is_dir():
+                    continue
+                add(os.path.join(entry.path, "terminal64.exe"))
+                if len(found) >= max_results:
+                    return found
+        except Exception:
+            pass
+
+    # Instalações em Program Files (muitos brokers instalam com nome próprio)
+    for env_name in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"):
+        root = os.environ.get(env_name)
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            for entry in os.scandir(root):
+                if not entry.is_dir():
+                    continue
+
+                # Checagem direta (rápida)
+                add(os.path.join(entry.path, "terminal64.exe"))
+                if len(found) >= max_results:
+                    return found
+
+                # Se o nome sugerir MT5, faz uma busca curta em subpastas
+                name = (entry.name or "").lower()
+                if any(tok in name for tok in ("metatrader", "mt5", "metaquotes")):
+                    for p in _walk_find_terminal64(entry.path, max_depth=3, max_results=max_results - len(found)):
+                        add(p)
+                        if len(found) >= max_results:
+                            return found
+        except Exception:
+            pass
+
+    return found
+
 def _detect_terminal() -> Optional[str]:
     for p in CANDIDATE_TERMINALS:
         if os.path.exists(p):
@@ -148,25 +256,67 @@ def _select_terminal_path(default_path: Optional[str]) -> str:
     cfg = _load_terminal_cfg()
     saved = cfg.get("terminal_path")
 
-    candidates = []
-    if saved and os.path.exists(saved):
-        candidates.append(("config", saved))
-    for p in CANDIDATE_TERMINALS:
-        if os.path.exists(p) and (p not in [c[1] for c in candidates]):
-            candidates.append(("detectado", p))
-    if default_path and os.path.exists(default_path) and (default_path not in [c[1] for c in candidates]):
-        candidates.append(("default", default_path))
+    candidates: List[tuple[str, str]] = []
 
+    def _add_candidate(src: str, path: str):
+        if not path:
+            return
+        try:
+            if not os.path.exists(path):
+                return
+        except Exception:
+            return
+        for _, p in candidates:
+            if (os.path.normcase(p) if os.name == "nt" else p) == (os.path.normcase(path) if os.name == "nt" else path):
+                return
+        candidates.append((src, path))
+
+    if saved:
+        _add_candidate("config", saved)
+    for p in CANDIDATE_TERMINALS:
+        _add_candidate("detectado", p)
+    if default_path:
+        _add_candidate("default", default_path)
+
+    # Se não achou nada nos caminhos conhecidos, faz varredura rápida em locais comuns.
+    if not candidates:
+        print("🔎 Procurando terminais MetaTrader 5 instalados...", flush=True)
+        for p in _scan_mt5_terminals():
+            _add_candidate("scan", p)
+
+    # Se ainda não achou, oferece fluxo interativo (manual/download) ao invés de só abortar.
     if not candidates:
         print("ERRO: terminal64.exe do MetaTrader 5 nao encontrado.", flush=True)
-        print("Instale o MetaTrader 5 e tente novamente.", flush=True)
+        print("Instale o MetaTrader 5 (Windows 64-bit) e tente novamente.", flush=True)
+        print(f"Download: {MT5_DOWNLOAD_URL}", flush=True)
         print("Opcional: salve o caminho em .rg_terminal.json (campo terminal_path).", flush=True)
-        sys.exit(1)
+        while True:
+            print("\nOpções:", flush=True)
+            print("  [D] Abrir página de download do MT5", flush=True)
+            print("  [M] Digitar caminho manual (ex.: C:\\Program Files\\MetaTrader 5\\terminal64.exe)", flush=True)
+            print("  [S] Sair", flush=True)
+            choice = input("Opção: ").strip().lower()
+            if choice in ("s", "q", "x"):
+                sys.exit(1)
+            if choice == "d":
+                try:
+                    webbrowser.open(MT5_DOWNLOAD_URL)
+                except Exception:
+                    pass
+                continue
+            if choice == "m" or choice == "":
+                entered = input("Caminho completo para terminal64.exe: ").strip().strip('"')
+                if os.path.exists(entered):
+                    _save_terminal_cfg(entered)
+                    return entered
+                print("Caminho não encontrado. Tente novamente.", flush=True)
+                continue
+            print("Opção inválida.", flush=True)
 
     while True:
         print("\nSelecione o terminal MT5 para o RiskGuard:", flush=True)
-        for idx, (_, path) in enumerate(candidates, 1):
-            print(f"  [{idx}] {path}", flush=True)
+        for idx, (src, path) in enumerate(candidates, 1):
+            print(f"  [{idx}] ({src}) {path}", flush=True)
         print("  [M] Digitar caminho manual (ex.: C:\\Program Files\\MetaTrader 5\\terminal64.exe)", flush=True)
         if candidates:
             print("  (ENTER para usar a primeira opção listada)", flush=True)

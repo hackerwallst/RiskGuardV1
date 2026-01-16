@@ -7,6 +7,8 @@ import traceback
 
 os.environ.setdefault("MPLBACKEND", "Agg")
 
+MT5_DOWNLOAD_URL = "https://www.metatrader5.com/pt/download"
+
 
 CRITICAL_IMPORTS = [
     "MetaTrader5",
@@ -95,8 +97,57 @@ def bootstrap_riskguard(logger: logging.Logger, app_dir: str):
             sys.path.insert(0, app_dir)
         os.environ["RG_HEALTH_CHECK"] = "1"
         import main  # noqa: F401
-        if hasattr(main, "_detect_terminal"):
-            _ = main._detect_terminal()
+
+        try:
+            cfg_path = os.path.join(app_dir, ".rg_terminal.json")
+            saved = None
+            if os.path.exists(cfg_path):
+                try:
+                    import json
+                    with open(cfg_path, "r", encoding="utf-8") as handle:
+                        saved = (json.load(handle) or {}).get("terminal_path")
+                except Exception:
+                    saved = None
+
+            if saved:
+                if os.path.exists(saved):
+                    logger.info("MT5 terminal configured: %s", saved)
+                else:
+                    logger.warning("MT5 terminal_path in .rg_terminal.json not found: %s", saved)
+
+            detected = None
+            if hasattr(main, "_detect_terminal"):
+                try:
+                    detected = main._detect_terminal()
+                except Exception:
+                    detected = None
+
+            scanned = []
+            if hasattr(main, "_scan_mt5_terminals"):
+                try:
+                    scanned = list(main._scan_mt5_terminals())
+                except Exception:
+                    scanned = []
+
+            found = []
+            seen = set()
+            for p in ([detected] + scanned):
+                if not p:
+                    continue
+                key = p.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(p)
+
+            if not saved:
+                if found:
+                    logger.warning("MT5 terminal detected but not configured (.rg_terminal.json). Ex.: %s", found[0])
+                else:
+                    logger.warning("MT5 terminal64.exe not detected. Install MetaTrader 5: %s", MT5_DOWNLOAD_URL)
+        except Exception:
+            logger.info("MT5 terminal check skipped (unexpected error).")
+
         logger.info("Bootstrap ok: main imported.")
     except Exception:  # noqa: BLE001 - explicit logging
         logger.error("Bootstrap failed:\n%s", traceback.format_exc())
