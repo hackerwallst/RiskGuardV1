@@ -1,26 +1,58 @@
 # Secrets / config local
-RiskGuardv0.0.2/config.txt
+RiskguardV1.1/config.txt
+RiskguardV1.1/.env
+RiskguardV1.1/.env.*
 
 # State / cache (runtime)
-RiskGuardv0.0.2/.rg_state.json
-RiskGuardv0.0.2/.rg_pertrade_interactive.json
-RiskGuardv0.0.2/.rg_terminal.json
-RiskGuardv0.0.2/.guard_lock
-RiskGuardv0.0.2/notify/.notify_last.txt
-RiskGuardv0.0.2/limits/.guard_breach_cache.json
-RiskGuardv0.0.2/limits/.rg_risk_block.json
-RiskGuardv0.0.2/news/ff_cache.json
+RiskguardV1.1/.rg_state.json
+RiskguardV1.1/.rg_pertrade_interactive.json
+RiskguardV1.1/.rg_terminal.json
+RiskguardV1.1/.rg_*.json
+RiskguardV1.1/.guard_lock
+RiskguardV1.1/notify/.notify_last.txt
+RiskguardV1.1/limits/.guard_breach_cache.json
+RiskguardV1.1/limits/.rg_risk_block.json
+RiskguardV1.1/limits/.riskguard_*.json
+RiskguardV1.1/limits/.riskguard_*.lock
+RiskguardV1.1/news/ff_cache.json
 
 # Reports (outputs)
-RiskGuardv0.0.2/reports/.monthly.flag
-RiskGuardv0.0.2/reports/*.html
-RiskGuardv0.0.2/reports/*.pdf
-RiskGuardv0.0.2/reports/*.csv
-RiskGuardv0.0.2/reports/*.png
+RiskguardV1.1/reports/.monthly.flag
+RiskguardV1.1/reports/*.html
+RiskguardV1.1/reports/*.pdf
+RiskguardV1.1/reports/*.csv
+RiskguardV1.1/reports/*.png
+RiskguardV1.1/reports/reports/
+
+# Virtual environments
+venv/
+.venv/
+RiskguardV1.1/venv/
+RiskguardV1.1/.venv/
 
 # Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
-# OS
+# Frontend deps/builds
+node_modules/
+dist/
+build/
+.vite/
+.parcel-cache/
+
+# Logs
+logs/
+*.log
+
+# OS / shortcuts
 .DS_Store
+Thumbs.db
+*.lnk
