@@ -73,8 +73,12 @@ class RiskGuardMT5Reader:
 
     # ---- conexão
     def connect(self) -> bool:
-        if not mt5.initialize(path=self.path):
-            return False
+        if self.path:
+            if not mt5.initialize(path=self.path):
+                return False
+        else:
+            if not mt5.initialize():
+                return False
         if self.login and self.password and self.server:
             if not mt5.login(self.login, password=self.password, server=self.server):
                 mt5.shutdown()

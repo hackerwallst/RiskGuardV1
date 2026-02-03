@@ -3,6 +3,8 @@ from __future__ import annotations
 
 # --- imports base ---
 import sys
+import re
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta, timezone
@@ -43,6 +45,7 @@ except ImportError:
         compute_R_from_trades,
     )
 import numpy as np
+from lxml import html as lxml_html
 
 # === RG: helpers de fluxos (depósitos/retiradas) — versão completa ===
 def _rg_extract_flows_from_deals(deals):
@@ -126,6 +129,251 @@ def _rg_make_equity_series(trades, equity_now, net_pnl):
     if not eq:
         eq = [("—", float(equity_now or 0.0))]
     return eq
+
+# =========================
+# MT5 HTML report parsing
+# =========================
+def _strip_accents(text: str) -> str:
+    return "".join(
+        ch for ch in unicodedata.normalize("NFKD", text or "") if not unicodedata.combining(ch)
+    )
+
+def _read_html_text(path: Path) -> str:
+    for enc in ("utf-16", "utf-8", "latin-1"):
+        try:
+            return path.read_text(encoding=enc)
+        except Exception:
+            continue
+    return path.read_text(errors="ignore")
+
+def _parse_float(value: str) -> float:
+    if value is None:
+        return 0.0
+    s = str(value).replace("\xa0", "").replace(",", "").strip()
+    if s == "" or s == "-":
+        return 0.0
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
+def _parse_mt5_html_report(path: Path) -> Dict[str, Any]:
+    text = _read_html_text(path)
+    root = lxml_html.fromstring(text)
+    rows = root.xpath("//table//tr")
+
+    def _cells(r):
+        cells = []
+        for c in r.xpath("./th|./td"):
+            cls = c.get("class") or ""
+            if "hidden" in cls:
+                continue
+            val = c.text_content().strip()
+            if val:
+                cells.append(val)
+        return cells
+
+    # account info
+    account: Dict[str, Any] = {}
+    report_dt: Optional[datetime] = None
+    for r in rows:
+        cells = _cells(r)
+        if len(cells) != 2:
+            continue
+        key = _strip_accents(cells[0]).rstrip(":").lower()
+        if key == "nome":
+            account["name"] = cells[1]
+        elif key == "conta":
+            raw = cells[1]
+            m = re.match(r"(\d+)\s*\((.+)\)", raw)
+            if m:
+                account["login"] = int(m.group(1))
+                parts = [p.strip() for p in m.group(2).split(",")]
+                if parts:
+                    account["currency"] = parts[0]
+                if len(parts) > 1:
+                    account["server"] = parts[1]
+            else:
+                account["login"] = raw
+        elif key == "empresa":
+            account["company"] = cells[1]
+        elif key == "data":
+            try:
+                report_dt = datetime.strptime(cells[1], "%Y.%m.%d %H:%M")
+            except Exception:
+                report_dt = None
+
+    # section indices
+    headers: Dict[str, int] = {}
+    for i, r in enumerate(rows):
+        cells = _cells(r)
+        if len(cells) == 1:
+            headers[_strip_accents(cells[0])] = i
+
+    pos_start = headers.get("Posicoes")
+    ord_start = headers.get("Ordens")
+    trans_start = headers.get("Transacoes")
+    res_start = headers.get("Resultados")
+
+    trades: List[Dict[str, Any]] = []
+    if pos_start is not None and ord_start is not None:
+        for r in rows[pos_start + 1 : ord_start]:
+            cells = _cells(r)
+            if not cells:
+                continue
+            if not re.match(r"^\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2}$", cells[0]):
+                continue
+            if len(cells) not in (12, 13):
+                continue
+            if len(cells) == 13:
+                time_in, pos_id, symbol, typ, vol, price, sl, tp, time_out, price_out, comm, sw, prof = cells
+            else:
+                time_in, pos_id, symbol, typ, vol, price, sl, time_out, price_out, comm, sw, prof = cells
+            comm_val = _parse_float(comm)
+            sw_val = _parse_float(sw)
+            price_in = _parse_float(price)
+            price_out_f = _parse_float(price_out)
+            pnl = _parse_float(prof) + comm_val + sw_val
+            try:
+                t0 = datetime.strptime(time_in, "%Y.%m.%d %H:%M:%S")
+                t1 = datetime.strptime(time_out, "%Y.%m.%d %H:%M:%S")
+            except Exception:
+                t0 = None
+                t1 = None
+            trades.append({
+                "position_id": int(pos_id) if str(pos_id).isdigit() else 0,
+                "symbol": symbol,
+                "volume": _parse_float(vol),
+                "pnl": pnl,
+                "commission": comm_val,
+                "swap": sw_val,
+                "price_in": price_in,
+                "price_out": price_out_f,
+                "start": t0.isoformat() if t0 else time_in,
+                "end": t1.isoformat() if t1 else time_out,
+                "holding_time_sec": (t1 - t0).total_seconds() if t0 and t1 else 0.0,
+                "type": typ,
+            })
+
+    # deals / balance series
+    events: List[Dict[str, Any]] = []
+    balance_points: List[Tuple[str, float]] = []
+    flow_deposits = 0.0
+    flow_withdrawals = 0.0
+    if trans_start is not None and res_start is not None:
+        for r in rows[trans_start + 1 : res_start]:
+            cells = _cells(r)
+            if not cells:
+                continue
+            if not re.match(r"^\d{4}\.\d{2}\.\d{2} \d{2}:\d{2}:\d{2}$", cells[0]):
+                continue
+            if len(cells) < 13:
+                continue
+            # layout (after removing hidden cost column):
+            # time, offer, symbol, type, direction, volume, price, order, commission, fee, swap, profit, balance, comment?
+            time_str = cells[0]
+            symbol = cells[2] if len(cells) > 2 else ""
+            typ = (cells[3] if len(cells) > 3 else "").lower()
+            volume = cells[5] if len(cells) > 5 else ""
+            commission = _parse_float(cells[8]) if len(cells) > 8 else 0.0
+            fee = _parse_float(cells[9]) if len(cells) > 9 else 0.0
+            swap = _parse_float(cells[10]) if len(cells) > 10 else 0.0
+            profit = _parse_float(cells[11]) if len(cells) > 11 else 0.0
+            balance = _parse_float(cells[12]) if len(cells) > 12 else None
+            comment = cells[13] if len(cells) > 13 else ""
+
+            if balance is not None:
+                balance_points.append((time_str, balance))
+
+            if typ in ("balance", "credit") or (not symbol and not str(volume).strip()):
+                if profit > 0:
+                    flow_deposits += profit
+                elif profit < 0:
+                    flow_withdrawals += abs(profit)
+
+            events.append({
+                "time": time_str,
+                "type": typ,
+                "symbol": symbol,
+                "volume": volume,
+                "profit": profit,
+                "commission": commission + fee,
+                "swap": swap,
+                "balance": balance,
+                "comment": comment,
+            })
+
+    balance_points_sorted = sorted(balance_points, key=lambda x: x[0])
+    start_balance = balance_points_sorted[0][1] if balance_points_sorted else 0.0
+    end_balance = balance_points_sorted[-1][1] if balance_points_sorted else start_balance
+
+    # absolute drawdown (balance)
+    initial_ref = start_balance
+    min_after = end_balance
+    trade_seen = False
+    for ev in sorted(events, key=lambda e: e.get("time", "")):
+        bal = ev.get("balance")
+        if bal is None:
+            continue
+        if not trade_seen:
+            if ev.get("type") in ("balance", "credit"):
+                initial_ref = bal
+                continue
+            trade_seen = True
+            min_after = bal
+            continue
+        if bal < min_after:
+            min_after = bal
+    abs_dd = max(0.0, float(initial_ref) - float(min_after))
+    abs_dd_pct = (abs_dd / float(initial_ref) * 100.0) if initial_ref else None
+
+    # max drawdown using balance points (full resolution)
+    dd_abs, dd_pct, dd_peak, dd_trough, dd_peak_lab, dd_trough_lab = _max_drawdown_stats(balance_points_sorted)
+
+    since_dt = None
+    until_dt = None
+    if balance_points_sorted:
+        try:
+            since_dt = datetime.strptime(balance_points_sorted[0][0], "%Y.%m.%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except Exception:
+            since_dt = None
+    if report_dt:
+        until_dt = report_dt.replace(tzinfo=timezone.utc) + timedelta(days=1)
+    elif balance_points_sorted:
+        try:
+            until_dt = datetime.strptime(balance_points_sorted[-1][0], "%Y.%m.%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            until_dt = until_dt + timedelta(days=1)
+        except Exception:
+            until_dt = None
+
+    return {
+        "account": account,
+        "report_dt": report_dt,
+        "trades": trades,
+        "balance_points": balance_points_sorted,
+        "start_balance": start_balance,
+        "end_balance": end_balance,
+        "flows": {
+            "deposits": round(flow_deposits, 2),
+            "withdrawals": round(flow_withdrawals, 2),
+            "net": round(flow_deposits - flow_withdrawals, 2),
+        },
+        "drawdown": {
+            "absolute_balance": round(abs_dd, 2),
+            "absolute_balance_pct": round(abs_dd_pct, 2) if abs_dd_pct is not None else None,
+            "max_balance": dd_abs,
+            "max_balance_pct": dd_pct,
+            "peak_balance": round(float(dd_peak or 0.0), 2),
+            "trough_balance": round(float(dd_trough or 0.0), 2),
+            "start_balance_est": round(float(start_balance or 0.0), 2),
+            "initial_balance_ref": round(float(initial_ref or 0.0), 2),
+            "min_balance": round(float(min_after or 0.0), 2),
+        },
+        "period": {
+            "since": since_dt.isoformat() if since_dt else None,
+            "until": until_dt.isoformat() if until_dt else None,
+        },
+    }
 
 def _rg_is_flow_deal(d: Dict[str, Any]) -> bool:
     typ = int(d.get("type", -999))
@@ -395,10 +643,12 @@ def _rg_extract_flows_wide_window(since: datetime, until: datetime):
 try:
     # se "reports" for um pacote (tem __init__.py)
     from .render_html import render_html
+    from .render_react import render_react_html
     from .render_pdf import html_to_pdf
 except ImportError:
     # se rodar direto: python reports/reports.py ...
     from render_html import render_html
+    from render_react import render_react_html
     from render_pdf import html_to_pdf
 
 # --- pastas de saída ---
@@ -482,8 +732,12 @@ def group_trades(deals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for pid, lst in by_pos.items():
         lst = sorted(lst, key=lambda x: x["time"])
         symbol = lst[0]["symbol"]
+        price_in = lst[0].get("price")
+        price_out = lst[-1].get("price")
         vol = sum(x["volume"] for x in lst if x["entry"] == 1 or x["entry"] is None)  # aproximado
-        profit = sum(x["profit"] for x in lst) + sum(x["commission"] for x in lst) + sum(x["swap"] for x in lst)
+        commission = sum(x.get("commission", 0.0) for x in lst)
+        swap = sum(x.get("swap", 0.0) for x in lst)
+        profit = sum(x["profit"] for x in lst) + commission + swap
         t0 = _utc(lst[0]["time"])
         t1 = _utc(lst[-1]["time"])
         holding_sec = (t1 - t0).total_seconds()
@@ -493,6 +747,10 @@ def group_trades(deals: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "symbol": symbol,
             "volume": vol,
             "pnl": profit,
+            "commission": commission,
+            "swap": swap,
+            "price_in": price_in,
+            "price_out": price_out,
             "start": t0.isoformat(),
             "end": t1.isoformat(),
             "holding_time_sec": holding_sec,
@@ -550,15 +808,19 @@ def compute_metrics(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     best = max(trades, key=lambda x: x["pnl"])
     worst = min(trades, key=lambda x: x["pnl"])
 
-    # PnL por símbolo
+    # PnL por símbolo + contagem por símbolo
     by_sym: Dict[str, float] = {}
+    by_sym_count: Dict[str, int] = {}
     for t in trades:
-        by_sym[t["symbol"]] = by_sym.get(t["symbol"], 0.0) + t["pnl"]
+        sym = t.get("symbol") or "-"
+        by_sym[sym] = by_sym.get(sym, 0.0) + t["pnl"]
+        by_sym_count[sym] = by_sym_count.get(sym, 0) + 1
 
-    # Curva cumulativa -> MaxDD (pelo resultado realizado)
+    # Curva cumulativa -> MaxDD (pelo resultado realizado, ordenado por fechamento)
+    ordered = sorted(trades, key=lambda t: t.get("end", ""))
     cum = 0.0
     cum_curve: List[float] = []
-    for t in trades:
+    for t in ordered:
         cum += t["pnl"]
         cum_curve.append(cum)
     max_dd_abs = 0.0
@@ -584,6 +846,7 @@ def compute_metrics(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
         "best_trade": best,
         "worst_trade": worst,
         "pnl_by_symbol": {k: v for k, v in sorted(by_sym.items(), key=lambda kv: -abs(kv[1]))},
+        "trades_by_symbol": {k: v for k, v in sorted(by_sym_count.items(), key=lambda kv: -kv[1])},
         "max_dd_abs": max_dd_abs,
         "max_dd_pct": max_dd_pct
     }
@@ -607,21 +870,202 @@ def compute_streaks(pnls: List[float]) -> Dict[str, Any]:
 
 def compute_expectancy_payoff(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not trades:
-        return {"expectancy": 0.0, "payoff": None, "avg_win": 0.0, "avg_loss": 0.0}
+        return {
+            "expectancy": 0.0,
+            "expected_payoff": 0.0,
+            "payoff_ratio": None,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+            "avg_loss_abs": 0.0,
+        }
     pnls = [t["pnl"] for t in trades]
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p < 0]
-    p_win = len(wins) / len(pnls) if pnls else 0.0
+
+    total = len(pnls) or 1
+    net_total = sum(pnls)
+    expected_payoff = net_total / total  # MT5: Net Profit / Total Trades
+
     avg_win = (sum(wins) / len(wins)) if wins else 0.0
-    avg_loss = (abs(sum(losses)) / len(losses)) if losses else 0.0
-    payoff = (avg_win / avg_loss) if avg_loss > 1e-12 else None
-    expectancy = p_win * avg_win - (1 - p_win) * avg_loss
+    avg_loss_abs = (abs(sum(losses)) / len(losses)) if losses else 0.0
+    avg_loss = -avg_loss_abs if losses else 0.0
+    payoff_ratio = (avg_win / avg_loss_abs) if avg_loss_abs > 1e-12 else None
+
     return {
-        "expectancy": expectancy,
-        "payoff": payoff,
+        "expectancy": expected_payoff,
+        "expected_payoff": expected_payoff,
+        "payoff_ratio": payoff_ratio,
+        "payoff": payoff_ratio,
         "avg_win": avg_win,
-        "avg_loss": avg_loss
+        "avg_loss": avg_loss,
+        "avg_loss_abs": avg_loss_abs,
     }
+
+def _pip_factor_from_price(price: Optional[float]) -> float:
+    try:
+        if price is None:
+            return 1.0
+        s = f"{float(price)}"
+        if "." not in s:
+            return 1.0
+        dec = len(s.split(".")[1].rstrip("0"))
+        if dec >= 4:
+            return 10000.0
+        if dec == 3:
+            return 100.0
+        if dec == 2:
+            return 100.0
+        if dec == 1:
+            return 10.0
+        return 1.0
+    except Exception:
+        return 1.0
+
+def _trade_pips(trade: Dict[str, Any]) -> Optional[float]:
+    pin = trade.get("price_in")
+    pout = trade.get("price_out")
+    if pin is None or pout is None:
+        return None
+    try:
+        pin_f = float(pin)
+        pout_f = float(pout)
+    except Exception:
+        return None
+    factor = _pip_factor_from_price(pin_f)
+    side = str(trade.get("type", "")).lower()
+    if side == "sell":
+        return (pin_f - pout_f) * factor
+    return (pout_f - pin_f) * factor
+
+def _z_score_runs(pnls: List[float]) -> Tuple[Optional[float], Optional[float]]:
+    import math
+    seq = [1 if p > 0 else 0 for p in pnls if p != 0]
+    if len(seq) < 2:
+        return None, None
+    n1 = sum(seq)
+    n2 = len(seq) - n1
+    if n1 == 0 or n2 == 0:
+        return None, None
+    runs = 1
+    for i in range(1, len(seq)):
+        if seq[i] != seq[i-1]:
+            runs += 1
+    expected = (2 * n1 * n2) / (n1 + n2) + 1
+    denom = ((n1 + n2) ** 2) * (n1 + n2 - 1)
+    num = 2 * n1 * n2 * (2 * n1 * n2 - n1 - n2)
+    if denom <= 0 or num <= 0:
+        return None, None
+    std = math.sqrt(num / denom)
+    if std <= 1e-12:
+        return None, None
+    z = (runs - expected) / std
+    # two-tailed probability
+    phi = 0.5 * (1 + math.erf(abs(z) / math.sqrt(2)))
+    prob = (1 - phi) * 2 * 100.0
+    return z, prob
+
+def compute_quality_stats(
+    trades: List[Dict[str, Any]],
+    met: Dict[str, Any],
+    balance_start: Optional[float] = None
+) -> Dict[str, Any]:
+    import math
+    total = len(trades)
+    pnls = [float(t.get("pnl", 0.0)) for t in trades]
+    avg_pnl = (sum(pnls) / total) if total else 0.0
+    std_pnl = None
+    if total > 1:
+        std_pnl = math.sqrt(sum((p - avg_pnl) ** 2 for p in pnls) / total)
+
+    sharpe = None
+    if std_pnl and std_pnl > 1e-12 and total > 1:
+        sharpe = (avg_pnl / std_pnl) * math.sqrt(total)
+
+    # Pips
+    pips_records: List[Tuple[Dict[str, Any], float]] = []
+    for t in trades:
+        p = _trade_pips(t)
+        if p is not None:
+            pips_records.append((t, float(p)))
+    total_pips = sum(p for _, p in pips_records) if pips_records else None
+    pips_wins = [p for t, p in pips_records if float(t.get("pnl", 0.0)) > 0]
+    pips_losses = [p for t, p in pips_records if float(t.get("pnl", 0.0)) < 0]
+    avg_win_pips = (sum(pips_wins) / len(pips_wins)) if pips_wins else None
+    avg_loss_pips = (sum(pips_losses) / len(pips_losses)) if pips_losses else None
+
+    best_pips = None
+    worst_pips = None
+    if pips_records:
+        best_pips = max(pips_records, key=lambda x: x[1])
+        worst_pips = min(pips_records, key=lambda x: x[1])
+
+    # Longs/Shorts won
+    def _is_buy(t): return str(t.get("type","")).lower() == "buy"
+    def _is_sell(t): return str(t.get("type","")).lower() == "sell"
+    long_total = sum(1 for t in trades if _is_buy(t))
+    long_wins = sum(1 for t in trades if _is_buy(t) and float(t.get("pnl", 0.0)) > 0)
+    short_total = sum(1 for t in trades if _is_sell(t))
+    short_wins = sum(1 for t in trades if _is_sell(t) and float(t.get("pnl", 0.0)) > 0)
+
+    # Commissions / Lots
+    total_lots = sum(float(t.get("volume", 0.0)) for t in trades)
+    total_comm = sum(float(t.get("commission", 0.0)) for t in trades)
+
+    # Expectancy in pips
+    expectancy_pips = (total_pips / total) if (total and total_pips is not None) else None
+
+    # AHPR / GHPR (per-trade returns)
+    ahpr = ghpr = None
+    if balance_start and balance_start > 0 and total:
+        bal = float(balance_start)
+        returns = []
+        for t in sorted(trades, key=lambda x: x.get("end", "")):
+            if bal <= 0:
+                break
+            r = float(t.get("pnl", 0.0)) / bal
+            returns.append(r)
+            bal += float(t.get("pnl", 0.0))
+        if returns:
+            ahpr = sum(returns) / len(returns) * 100.0
+            prod = 1.0
+            for r in returns:
+                prod *= (1 + r)
+            if prod > 0:
+                ghpr = (prod ** (1 / len(returns)) - 1) * 100.0
+
+    z_score, z_prob = _z_score_runs(pnls)
+
+    best_trade = met.get("best_trade")
+    worst_trade = met.get("worst_trade")
+
+    out = {
+        "pips_total": total_pips,
+        "avg_win_pips": avg_win_pips,
+        "avg_loss_pips": avg_loss_pips,
+        "best_trade_pips": {"pips": best_pips[1], "end": best_pips[0].get("end")} if best_pips else None,
+        "worst_trade_pips": {"pips": worst_pips[1], "end": worst_pips[0].get("end")} if worst_pips else None,
+        "longs_won": {
+            "wins": long_wins, "total": long_total,
+            "rate": (long_wins / long_total * 100.0) if long_total else None
+        },
+        "shorts_won": {
+            "wins": short_wins, "total": short_total,
+            "rate": (short_wins / short_total * 100.0) if short_total else None
+        },
+        "lots_total": total_lots,
+        "commissions_total": total_comm,
+        "std_pnl": std_pnl,
+        "sharpe": sharpe,
+        "z_score": z_score,
+        "z_prob": z_prob,
+        "expectancy_pips": expectancy_pips,
+        "ahpr": ahpr,
+        "ghpr": ghpr,
+        "avg_trade_length_sec": met.get("avg_holding"),
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
+    }
+    return out
 
 # =========================================
 # 3) Mensal / Semanal / Distribuições (Fase A)
@@ -716,6 +1160,7 @@ def build_report(
     curve_deals = sorted(flow_deals + trade_deals, key=lambda d: d.get("time", ""))
 
     trades = group_trades(trade_deals)
+    trades.sort(key=lambda t: t.get("end", ""))
     met = compute_metrics(trades)
 
     streaks = compute_streaks([t["pnl"] for t in trades])
@@ -731,6 +1176,7 @@ def build_report(
     eq_points, balance_start, balance_end, trade_delta, flow_delta, total_delta = _rg_make_balance_series(
         curve_deals, balance_now
     )
+    qual.update(compute_quality_stats(trades, met, balance_start))
     dd_abs, dd_pct, dd_peak, dd_trough, dd_peak_lab, dd_trough_lab = _max_drawdown_stats(eq_points)
     met["max_dd_abs"] = dd_abs
     met["max_dd_pct"] = dd_pct
@@ -833,10 +1279,7 @@ def build_report(
         "equity_now": equity_now,
         "metrics": met,
         "quality": {
-            "expectancy": qual["expectancy"],
-            "payoff": qual["payoff"],
-            "avg_win": qual["avg_win"],
-            "avg_loss": qual["avg_loss"],
+            **qual,
             "win_streak": streaks["win_streak"],
             "loss_streak": streaks["loss_streak"],
             "max_dd_abs_curve": dd_abs,
@@ -904,7 +1347,10 @@ def build_report(
         print(f"Melhor: {_fmt_usd(met['best_trade']['pnl'])} | Pior: {_fmt_usd(met['worst_trade']['pnl'])}")
     print(f"Tempo médio por trade: {_seconds_to_hms(met['avg_holding'] or 0)}")
     print(f"Symbols com maior impacto: {list(met['pnl_by_symbol'].items())[:5]}")
-    print(f"Expectancy: {_fmt_usd(qual['expectancy'])} | Payoff: {qual['payoff']:.2f}" if qual['payoff'] is not None else f"Expectancy: {_fmt_usd(qual['expectancy'])} | Payoff: N/D")
+    exp_payoff = qual.get("expected_payoff", qual.get("expectancy", 0.0))
+    payoff_ratio = qual.get("payoff_ratio")
+    payoff_ratio_str = f"{payoff_ratio:.2f}" if payoff_ratio is not None else "N/D"
+    print(f"Payoff (MT5): {_fmt_usd(exp_payoff)} | Payoff ratio: {payoff_ratio_str}")
     print(f"Streaks -> Win: {streaks['win_streak']} | Loss: {streaks['loss_streak']}")
     print(f"Mensal ($): {monthly}")
     print(f"Semanal ($): {weekly}")
@@ -970,13 +1416,13 @@ def build_report(
 
     fan_path = dd_path = None
     try:
-        fig_fan = mc_fig_fanchart(paths, title=f"Monte Carlo – {MC_TRADES} trades ({MC_ITER} iterações)")
-        fan_path = OUT_DIR / f"mc_fanchart_{base}.png"
-        fig_fan.savefig(fan_path, dpi=120, bbox_inches="tight")
+        fig_fan = mc_fig_fanchart(paths, title="")
+        fan_path = OUT_DIR / f"mc_fanchart_{base}.svg"
+        fig_fan.savefig(fan_path, format="svg", bbox_inches="tight")
 
-        fig_dd = mc_fig_dd_hist(paths, bins=30, title="Distribuição do Máx. Drawdown")
-        dd_path = OUT_DIR / f"mc_dd_hist_{base}.png"
-        fig_dd.savefig(dd_path, dpi=120, bbox_inches="tight")
+        fig_dd = mc_fig_dd_hist(paths, bins=30, title="")
+        dd_path = OUT_DIR / f"mc_dd_hist_{base}.svg"
+        fig_dd.savefig(dd_path, format="svg", bbox_inches="tight")
     except Exception as e:
         print("[MC] Aviso: não foi possível gerar figuras (ok):", repr(e))
         fan_path = dd_path = None
@@ -1010,7 +1456,11 @@ def build_report(
 
     # === HTML e PDF ===
     html_path = OUT_DIR / f"report_{account.get('login')}_{ts_tag}.html"
-    render_html(summary, html_path)
+    try:
+        render_react_html(summary, html_path)
+    except Exception as e:
+        print(f"[reports] react render failed: {e}")
+        render_html(summary, html_path)
 
     pdf_path = OUT_DIR / f"report_{account.get('login')}_{ts_tag}.pdf"
     ok_pdf = html_to_pdf(html_path, pdf_path)  # Playwright
@@ -1043,6 +1493,254 @@ def build_report(
 
     return summary
 
+# =========================
+# HTML (MT5) offline report
+# =========================
+def build_report_from_html(path: Path) -> Dict[str, Any]:
+    parsed = _parse_mt5_html_report(path)
+    trades = parsed.get("trades", [])
+    trades.sort(key=lambda t: t.get("end", ""))
+
+    met = compute_metrics(trades)
+    streaks = compute_streaks([t["pnl"] for t in trades])
+    qual = compute_expectancy_payoff(trades)
+    qual.update(compute_quality_stats(trades, met, parsed.get("start_balance")))
+
+    monthly = group_by_month(trades)
+    weekly = group_by_week(trades)
+    distro = distro_weekday_hour(trades)
+
+    account = parsed.get("account", {})
+    balance_now = float(parsed.get("end_balance") or 0.0)
+    equity_now = balance_now
+
+    drawdown = parsed.get("drawdown", {}) or {}
+    balance_points = parsed.get("balance_points") or []
+    if balance_points:
+        eq_points = [(t.split("T")[0] if "T" in t else t.split(" ")[0], float(v)) for t, v in balance_points]
+    else:
+        eq_points = _rg_make_equity_series(trades, equity_now, met.get("net_pnl", 0.0))
+
+    since_str = (parsed.get("period") or {}).get("since")
+    until_str = (parsed.get("period") or {}).get("until")
+    since_dt = datetime.fromisoformat(since_str) if since_str else None
+    until_dt = datetime.fromisoformat(until_str) if until_str else None
+
+    eq_daily = _rg_daily_equity(eq_points, since_dt, until_dt) if since_dt and until_dt else []
+    monthly_gain_pct: Dict[str, float] = {}
+    if eq_daily:
+        first_by_month, last_by_month = {}, {}
+        for day, eq in eq_daily:
+            key = day[:7]
+            first_by_month.setdefault(key, float(eq))
+            last_by_month[key] = float(eq)
+        for key in sorted(last_by_month):
+            first = first_by_month.get(key, 0.0)
+            last = last_by_month.get(key, 0.0)
+            if first > 0:
+                monthly_gain_pct[key] = round((last / first - 1.0) * 100.0, 2)
+
+    flows = parsed.get("flows", {})
+    validation = {
+        "scope": "mt5_html",
+        "balance_now": round(balance_now, 2),
+        "equity_now": round(equity_now, 2),
+        "floating_pnl": 0.0,
+        "balance_start_est": round(float(parsed.get("start_balance") or 0.0), 2),
+        "balance_end_est": round(balance_now, 2),
+        "trade_pnl_period": round(float(met.get("net_pnl") or 0.0), 2),
+        "trade_pnl_reported": round(float(met.get("net_pnl") or 0.0), 2),
+        "trade_pnl_diff": 0.0,
+        "flows_period_deposits": round(float(flows.get("deposits") or 0.0), 2),
+        "flows_period_withdrawals": round(float(flows.get("withdrawals") or 0.0), 2),
+        "net_flows_period": round(float(flows.get("net") or 0.0), 2),
+        "balance_delta_period": round(balance_now - float(parsed.get("start_balance") or 0.0), 2),
+    }
+
+    summary = {
+        "period": {
+            "since": since_str or "",
+            "until": until_str or "",
+        },
+        "account": {
+            "login": account.get("login"),
+            "server": account.get("server"),
+            "currency": account.get("currency"),
+        },
+        "equity_now": equity_now,
+        "metrics": met,
+        "quality": {
+            **qual,
+            "win_streak": streaks["win_streak"],
+            "loss_streak": streaks["loss_streak"],
+            "max_dd_abs_curve": drawdown.get("max_balance", 0.0),
+            "max_dd_pct_curve": drawdown.get("max_balance_pct", 0.0),
+            "max_dd_window": {
+                "from": None,
+                "to": None,
+            },
+        },
+        "drawdown": drawdown,
+        "period_tables": {
+            "monthly": monthly,
+            "weekly": weekly,
+            "monthly_gain_pct": monthly_gain_pct,
+        },
+        "distribution": distro,
+        "riskguard": {"events_total": 0, "by_type": {}, "closed_total": 0},
+        "flows_summary": {
+            "total_deposits": round(float(flows.get("deposits") or 0.0), 2),
+            "total_withdrawals": round(float(flows.get("withdrawals") or 0.0), 2),
+            "net_flows": round(float(flows.get("net") or 0.0), 2),
+        },
+        "timeseries": {
+            "equity": eq_points,
+            "equity_daily": eq_daily,
+            "flows": {"deposit": [], "withdrawal": []},
+        },
+        "validation": validation,
+        "drawdown_history": {},
+    }
+
+    # Base (para arquivos de saida)
+    ts_tag = datetime.now().strftime("%Y%m%d-%H%M%S")
+    login_tag = account.get("login") or "mt5_html"
+    base = f"{login_tag}_{ts_tag}"
+
+    # === MONTE CARLO (offline) ===
+    try:
+        MC_ITER = 5000
+        MC_TRADES = max(100, len(trades))
+        MC_METHOD = "block"
+        MC_BLOCK = 5
+        MC_RISK_PCT = get_float("MC_RISK_PCT", 0.01)
+        MC_DD_LIMIT = get_float("MC_DD_LIMIT", 0.30)
+
+        try:
+            mc_start_equity = float(summary.get("equity_now") or 0.0) - float(met.get("net_pnl") or 0.0)
+            if mc_start_equity <= 1e-6:
+                mc_start_equity = float(summary.get("equity_now") or 1000.0)
+        except Exception:
+            mc_start_equity = float(summary.get("equity_now") or 0.0)
+
+        trades_for_mc = [
+            t for t in trades
+            if int(t.get("position_id", 0)) != 0
+            and str(t.get("symbol") or "").strip() != ""
+            and abs(float(t.get("pnl", 0.0))) >= 0.05
+        ]
+
+        try:
+            R_hist, est_risk_pct = compute_R_from_trades(
+                trades_for_mc if len(trades_for_mc) >= 5 else trades,
+                equity_start=mc_start_equity,
+                fallback_risk_pct=MC_RISK_PCT,
+            )
+        except Exception:
+            R_hist = np.array([-1.0, -0.5, -0.25, 0.25, 0.5, 1.0, 2.0])
+            est_risk_pct = MC_RISK_PCT
+
+        paths = simulate_paths(
+            returns_R=R_hist,
+            start_equity=mc_start_equity if mc_start_equity > 0 else (summary.get("equity_now") or 1000.0),
+            risk_pct=est_risk_pct,
+            n_trades=MC_TRADES,
+            iterations=MC_ITER,
+            method=MC_METHOD,
+            block_size=MC_BLOCK,
+            fee_per_trade=0.0,
+            seed=42
+        )
+
+        mc_summary = summarize_paths(
+            paths,
+            start_equity=mc_start_equity if mc_start_equity > 0 else (summary.get("equity_now") or 1000.0),
+            dd_limit_pct=MC_DD_LIMIT
+        )
+
+        fan_path = dd_path = None
+        try:
+            fig_fan = mc_fig_fanchart(paths, title="")
+            fan_path = OUT_DIR / f"mc_fanchart_{base}.svg"
+            fig_fan.savefig(fan_path, format="svg", bbox_inches="tight")
+
+            fig_dd = mc_fig_dd_hist(paths, bins=30, title="")
+            dd_path = OUT_DIR / f"mc_dd_hist_{base}.svg"
+            fig_dd.savefig(dd_path, format="svg", bbox_inches="tight")
+        except Exception as e:
+            print(f"[reports] MC plotting failed: {e}")
+            fan_path = dd_path = None
+
+        tabela_mc = mc_table(mc_summary)
+
+        summary["monte_carlo"] = {
+            "config": {
+                "iterations": MC_ITER,
+                "n_trades": MC_TRADES,
+                "method": MC_METHOD,
+                "block_size": MC_BLOCK,
+                "risk_pct": float(est_risk_pct),
+                "dd_limit_pct": MC_DD_LIMIT,
+                "start_equity": mc_start_equity,
+            },
+            "final_equity": mc_summary["final_equity"],
+            "final_pnl": mc_summary["final_pnl"],
+            "final_return_pct": mc_summary["final_return_pct"],
+            "max_drawdown": mc_summary["max_drawdown"],
+            "prob_ruin_peak": mc_summary.get("prob_ruin_peak"),
+            "prob_ruin_floor": mc_summary.get("prob_ruin_floor"),
+            "table": tabela_mc,
+            "plots": {
+                "fan_chart": str(fan_path) if fan_path else None,
+                "dd_hist":   str(dd_path)  if dd_path  else None,
+            }
+        }
+    except Exception:
+        pass
+
+    # Outputs
+
+    csv_path = OUT_DIR / f"trades_{base}.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["position_id","symbol","volume","pnl","start","end","holding_sec","type"])
+        for t in trades:
+            w.writerow([
+                t["position_id"], t["symbol"], t["volume"], f"{t['pnl']:.2f}",
+                t["start"], t["end"], int(t["holding_time_sec"]), t["type"]
+            ])
+
+    html_path = OUT_DIR / f"report_{login_tag}_{ts_tag}.html"
+    try:
+        render_react_html(summary, html_path)
+    except Exception as e:
+        print(f"[reports] react render failed: {e}")
+        render_html(summary, html_path)
+
+    pdf_path = OUT_DIR / f"report_{login_tag}_{ts_tag}.pdf"
+    ok_pdf = html_to_pdf(html_path, pdf_path, mode="raster_pdf")
+
+    json_path = OUT_DIR / f"summary_{base}.json"
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2, default=str)
+
+    print("\n=== RiskGuard Performance Report (MT5 HTML) ===")
+    print(f"Conta: {account.get('login')} | Servidor: {account.get('server')} | Moeda: {account.get('currency')}")
+    print(f"Período: {since_str or '-'} até {until_str or '-'}")
+    print(f"Balance agora: {_fmt_usd(balance_now)} | Equity agora: {_fmt_usd(equity_now)}")
+    print(f"Trades: {met['trades']} | Win%: {met['win_rate']:.2f}%")
+    print(f"Net PnL: {_fmt_usd(met['net_pnl'])}")
+    print(f"Payoff (MT5): {_fmt_usd(qual['expected_payoff'])} | Payoff ratio: {qual['payoff_ratio'] if qual['payoff_ratio'] is not None else 'N/D'}")
+    print("\nArquivos salvos:")
+    print(f" - Trades CSV: {csv_path}")
+    print(f" - Summary JSON: {json_path}")
+    if ok_pdf and pdf_path.exists():
+        print(f" - PDF: {pdf_path}")
+    else:
+        print(f" - HTML: {html_path}")
+
+    return summary
+
 # =========
 # 6) CLI
 # =========
@@ -1050,11 +1748,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--from", dest="date_from", type=str, help="YYYY-MM-DD (inclusivo)")
     parser.add_argument("--to", dest="date_to", type=str, help="YYYY-MM-DD (exclusivo; default=amanhã)")
+    parser.add_argument("--mt5-html", dest="mt5_html", type=str, help="Caminho para relatório HTML do MT5 (offline)")
     parser.add_argument("--notify", action="store_true", help="Enviar resumo para o Telegram")
-    parser.add_argument("--terminal", type=str, default=r"C:\Program Files\MetaTrader 5\terminal64.exe", help="Caminho do terminal MT5")
+    parser.add_argument("--terminal", type=str, help="Caminho do terminal MT5 (opcional)")
     parser.add_argument("--magic", type=str, help="Lista de magic numbers separados por vírgula (ex: 123,9999)")
     parser.add_argument("--manual-only", action="store_true", help="Somente operações manuais (magic=0)")
     args = parser.parse_args()
+
+    if args.mt5_html:
+        build_report_from_html(Path(args.mt5_html))
+        return
 
     date_to = _dt(args.date_to) if args.date_to else (_now_utc().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1))
     if args.date_from:

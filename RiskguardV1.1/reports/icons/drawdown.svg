@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Drawdown">
+  <path d="M12 14a2 2 0 0 1 2-2h36a2 2 0 1 1 0 4H16v32h34a2 2 0 1 1 0 4H14a2 2 0 0 1-2-2V14z" fill="currentColor" opacity="0.25"></path>
+  <path d="M18 24l12 10 8-6 8 8a2 2 0 0 1-2.8 2.8l-5.2-5.2-8 6-14-11.7A2 2 0 1 1 18 24z" fill="currentColor"></path>
+  <path d="M44 44a2 2 0 0 1 2-2h8v-8a2 2 0 1 1 4 0v10a2 2 0 0 1-2 2H46a2 2 0 0 1-2-2z" fill="currentColor" opacity="0.55"></path>
+</svg>

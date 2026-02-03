@@ -41,6 +41,16 @@ def _get_plt():
         return None
 
 
+def _apply_soft_style(ax):
+    ax.set_facecolor("#ffffff")
+    ax.grid(True, axis="both", linestyle=(0, (2, 3)), linewidth=0.8, color="#e5e7eb")
+    ax.set_axisbelow(True)
+    ax.tick_params(axis="both", colors="#6b7280", labelsize=9)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    ax.spines["left"].set_color("#d1d5db")
+    ax.spines["bottom"].set_color("#d1d5db")
+
 # ===========================
 # Helpers internos
 # ===========================
@@ -433,37 +443,41 @@ def summarize_paths(
 # ===========================
 # Gráficos
 # ===========================
-def mc_fig_fanchart(paths: np.ndarray, title: str = "Monte Carlo – Fan Chart"):
+def mc_fig_fanchart(paths: np.ndarray, title: str = "Monte Carlo - Fan Chart"):
     plt = _get_plt()
     if plt is None:
-        raise RuntimeError("matplotlib não está disponível no ambiente.")
+        raise RuntimeError("matplotlib nao esta disponivel no ambiente.")
     iters, n_steps = paths.shape
     x = np.arange(n_steps)
     fan = _percentiles_over_time(paths)
 
-    fig, ax = plt.subplots()
-    ax.plot(x, fan["p50"], label="Mediana")
-    ax.fill_between(x, fan["p25"], fan["p75"], alpha=0.3, label="IQR (p25–p75)")
-    ax.fill_between(x, fan["p5"], fan["p95"], alpha=0.15, label="Faixa (p5–p95)")
-    ax.set_xlabel("Trade #")
-    ax.set_ylabel("Equity")
-    ax.set_title(title)
-    ax.legend()
-    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
+    fig, ax = plt.subplots(figsize=(7.2, 3.6))
+    ax.plot(x, fan["p5"], color="#3b82f6", linewidth=2.0)
+    ax.plot(x, fan["p50"], color="#f59e0b", linewidth=2.0)
+    ax.set_xlabel("Trade #", fontsize=9, color="#6b7280")
+    ax.set_ylabel("")
+    if title:
+        ax.set_title(title, fontsize=11, color="#111827", pad=8)
+    ax.margins(x=0)
+    _apply_soft_style(ax)
+    fig.tight_layout()
     return fig
 
-def mc_fig_dd_hist(paths: np.ndarray, bins: int = 30, title: str = "Distribuição do Máx. Drawdown"):
+
+def mc_fig_dd_hist(paths: np.ndarray, bins: int = 30, title: str = "Distribuicao do Max. Drawdown"):
     plt = _get_plt()
     if plt is None:
-        raise RuntimeError("matplotlib não está disponível no ambiente.")
+        raise RuntimeError("matplotlib nao esta disponivel no ambiente.")
     max_dd = np.apply_along_axis(_max_drawdown, 1, paths)
 
-    fig, ax = plt.subplots()
-    ax.hist(max_dd * 100.0, bins=bins)
-    ax.set_xlabel("Máx. Drawdown (%)")
-    ax.set_ylabel("Frequência")
-    ax.set_title(title)
-    ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
+    fig, ax = plt.subplots(figsize=(7.2, 3.6))
+    ax.hist(max_dd * 100.0, bins=bins, color="#3b82f6", alpha=0.9, rwidth=0.9, edgecolor="none")
+    ax.set_xlabel("Max. Drawdown (%)", fontsize=9, color="#6b7280")
+    ax.set_ylabel("")
+    if title:
+        ax.set_title(title, fontsize=11, color="#111827", pad=8)
+    _apply_soft_style(ax)
+    fig.tight_layout()
     return fig
 
 
@@ -519,7 +533,9 @@ def mc_save_fanchart(paths: np.ndarray, out_path: str, title: str = "Monte Carlo
             return False
         fig = mc_fig_fanchart(paths, title=title)
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_path, dpi=120, bbox_inches="tight")
+        out = Path(out_path)
+        dpi = 300 if out.suffix.lower() != ".svg" else None
+        fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
         plt.close(fig)
         return True
     except Exception as e:
@@ -533,7 +549,9 @@ def mc_save_dd_hist(paths: np.ndarray, out_path: str, bins: int = 30, title: str
             return False
         fig = mc_fig_dd_hist(paths, bins=bins, title=title)
         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(out_path, dpi=120, bbox_inches="tight")
+        out = Path(out_path)
+        dpi = 300 if out.suffix.lower() != ".svg" else None
+        fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
         plt.close(fig)
         return True
     except Exception as e:

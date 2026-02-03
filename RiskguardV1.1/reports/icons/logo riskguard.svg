@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="RiskGuard icon">
+  <defs>
+    <linearGradient id="rgGrad" x1="10" y1="8" x2="54" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2F80FF"></stop>
+      <stop offset="1" stop-color="#1B4FD6"></stop>
+    </linearGradient>
+  </defs>
+
+  <!-- Shield -->
+  <path fill="url(#rgGrad)" d="M32 4c8.4 6 16.8 7.2 22 8.1V30c0 15.5-11 26.2-22 30C21 56.2 10 45.5 10 30V12.1C15.2 11.2 23.6 10 32 4z"></path>
+
+  <!-- Inner highlight -->
+  <path fill="#FFFFFF" opacity="0.18" d="M32 7c7.2 5 14.6 6.2 19 7V30c0 13.4-9.3 22.8-19 26C22.3 52.8 13 43.4 13 30V14c4.4-.8 11.8-2 19-7z"></path>
+
+  <!-- Check -->
+  <path fill="#FFFFFF" d="M28.2 36.8l-5.1-5.1a2 2 0 0 0-2.8 2.8l6.5 6.5a2 2 0 0 0 2.8 0l14-14a2 2 0 1 0-2.8-2.8l-12.6 12.6z"></path>
+</svg>

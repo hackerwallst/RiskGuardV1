@@ -4,7 +4,7 @@ import { ConfigField } from '@/app/components/ConfigField';
 import { ToggleSwitch } from '@/app/components/ToggleSwitch';
 import { NumberInput } from '@/app/components/NumberInput';
 import { CopyButton } from '@/app/components/CopyButton';
-import { Send, ShieldAlert, TrendingDown, Newspaper, BarChart3 } from 'lucide-react';
+import { Send, ShieldAlert, TrendingDown, Newspaper } from 'lucide-react';
 
 export default function App() {
   return (
@@ -111,21 +111,7 @@ export default function App() {
           </ConfigField>
         </ConfigSection>
 
-        {/* Monte Carlo Simulação Section */}
-        <ConfigSection
-          title="Monte Carlo Simulação"
-          icon={<BarChart3 className="w-full h-full" />}
-          iconColor="text-emerald-500"
-        >
-          <ConfigField label="Risco MC %:">
-            <NumberInput value="0.01" suffix="%" width="w-20" />
-          </ConfigField>
-
-          <ConfigField label="Limite de MC DD:">
-            <NumberInput value="30" suffix="%" width="w-20" />
-          </ConfigField>
-        </ConfigSection>
-
+        
         {/* Footer Status */}
         <div className="text-center py-8">
           <div className="inline-flex items-center gap-4">

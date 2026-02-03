@@ -17,8 +17,7 @@ def _pdf_vetorial(html_path: Path, pdf_path: Path, wait_ms=2000, usar_css_tela=T
             path=str(pdf_path),
             print_background=True,
             prefer_css_page_size=True,
-            format="A4",
-            margin={"top":"10mm","right":"10mm","bottom":"12mm","left":"10mm"},
+            margin={"top":"0","right":"0","bottom":"0","left":"0"},
         )
         context.close(); browser.close()
     return pdf_path.exists() and pdf_path.stat().st_size > 0
@@ -30,7 +29,7 @@ def _pdf_screenshot(html_path: Path, pdf_path: Path, wait_ms=2000) -> bool:
     html_uri = html_path.resolve().as_uri()
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(viewport={"width":1280,"height":720}, device_scale_factor=1.0)
+        context = browser.new_context(viewport={"width":1280,"height":720}, device_scale_factor=2.0)
         page = context.new_page()
         page.goto(html_uri, wait_until="networkidle")
         if wait_ms: page.wait_for_timeout(wait_ms)
@@ -46,7 +45,7 @@ def _pdf_screenshot(html_path: Path, pdf_path: Path, wait_ms=2000) -> bool:
 def html_to_pdf(
     html_path: Path,
     pdf_path: Path,
-    mode: str = "browser_pdf",
+    mode: str = "raster_pdf",
     wait_ms: int = 2000,
     usar_css_tela: bool = True
 ) -> bool:

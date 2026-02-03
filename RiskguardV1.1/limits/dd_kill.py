@@ -175,6 +175,7 @@ def dd_status() -> Dict[str, Any]:
             cooldown_iso = None  # expirada ou inválida → não mostrar
     return {
         "peak_equity": st.get("peak_equity"),
+        "tracking_started_at": st.get("tracking_started_at"),
         "dd_limit_pct": st.get("dd_limit_pct"),
         "cooldown_until": cooldown_iso,
         "awaiting_unlock": bool(st.get("awaiting_unlock", False)),
@@ -207,10 +208,28 @@ def enforce_drawdown(reader: RiskGuardMT5Reader,
         - "physical": idem + ganchos para desligar AutoTrading (se integrados externamente).
     """
     snap = reader.snapshot()
-    equity = float(snap["account"]["equity"])
+    acct = snap.get("account") or {}
+    equity = float(acct.get("equity") or 0.0)
     positions = list(snap.get("positions", []))
 
     st = _load()
+    login = acct.get("login")
+    server = acct.get("server")
+    tracking_initialized = False
+
+    # Inicializa tracking por conta (primeira vez) e evita DD histórico
+    if (st.get("account_login") != login) or (not st.get("tracking_started_at")):
+        keep_sha = st.get("twofa_sha256")
+        st = {"twofa_sha256": keep_sha} if keep_sha else {}
+        st["account_login"] = login
+        st["account_server"] = server
+        st["tracking_started_at"] = _iso_z(_now_utc())
+        st["baseline_equity"] = float(equity)
+        st["peak_equity"] = float(equity)
+        st["awaiting_unlock"] = False
+        if "cooldown_until" in st:
+            del st["cooldown_until"]
+        tracking_initialized = True
     peak = st.get("peak_equity")
     if not isinstance(peak, (int, float)) or peak <= 0:
         peak = equity
@@ -225,6 +244,12 @@ def enforce_drawdown(reader: RiskGuardMT5Reader,
             in_cooldown = (_now_utc() < cu_dt.astimezone(timezone.utc))
         else:
             in_cooldown = False
+    # Clear expired/invalid cooldown from state
+    if cooldown_iso:
+        if (not cu_dt) or (_now_utc() >= cu_dt.astimezone(timezone.utc)):
+            cooldown_iso = None
+            if "cooldown_until" in st:
+                del st["cooldown_until"]
 
     # Atualiza pico somente fora do cooldown e quando equity faz nova máxima
     if not in_cooldown and equity > peak:
@@ -245,54 +270,66 @@ def enforce_drawdown(reader: RiskGuardMT5Reader,
         "in_cooldown": in_cooldown,
         "awaiting_unlock": awaiting_unlock,
         "tripped": False,
+        "tripped_now": False,
+        "tracking_initialized": tracking_initialized,
         "mode": mode,
     }
 
     # Trip do DD
     if dd_pct >= dd_limit_pct - 1e-9:
         rep["tripped"] = True
+        # Se já está em cooldown ou aguardando unlock, não reexecuta ações
+        if not in_cooldown and not awaiting_unlock:
+            rep["tripped_now"] = True
+            st["last_trip_at"] = _iso_z(_now_utc())
 
-        # Fecha TODAS as posições — resiliente
-        for pos in positions:
-            try:
-                ticket = int(pos.get("ticket"))
-                symbol = pos.get("symbol")
-                volume = float(pos.get("volume", 0.0))
-                side = _coerce_side_for_close(pos.get("type"))
-                if volume <= 0:
-                    raise ValueError("volume inválido para fechamento total")
-                ok, res = close_position_full(
-                    ticket=ticket,
-                    symbol=symbol,
-                    side=side,
-                    volume=volume,
-                    comment="RG DD kill"
-                )
-                (rep["closed"] if ok else rep["failed"]).append(
-                    {"ticket": ticket, "symbol": symbol, "result": res}
-                )
-            except Exception as e:
-                rep["failed"].append({
-                    "ticket": int(pos.get("ticket", -1)) if str(pos.get("ticket", "")).isdigit() else pos.get("ticket"),
-                    "symbol": pos.get("symbol"),
-                    "error": str(e)
-                })
+            # Fecha TODAS as posições — resiliente
+            for pos in positions:
+                try:
+                    ticket = int(pos.get("ticket"))
+                    symbol = pos.get("symbol")
+                    volume = float(pos.get("volume", 0.0))
+                    side = _coerce_side_for_close(pos.get("type"))
+                    if volume <= 0:
+                        raise ValueError("volume inválido para fechamento total")
+                    ok, res = close_position_full(
+                        ticket=ticket,
+                        symbol=symbol,
+                        side=side,
+                        volume=volume,
+                        comment="RG DD kill"
+                    )
+                    (rep["closed"] if ok else rep["failed"]).append(
+                        {"ticket": ticket, "symbol": symbol, "result": res}
+                    )
+                except Exception as e:
+                    rep["failed"].append({
+                        "ticket": int(pos.get("ticket", -1)) if str(pos.get("ticket", "")).isdigit() else pos.get("ticket"),
+                        "symbol": pos.get("symbol"),
+                        "error": str(e)
+                    })
 
-        # Ativa kill switch lógico até fim do cooldown
-        until = _now_utc() + timedelta(days=cooldown_days)
-        set_kill_until(until)
-        cu_iso = _iso_z(until)
-        rep["cooldown_until"] = cu_iso
+            # Ativa kill switch lógico até fim do cooldown
+            until = _now_utc() + timedelta(days=cooldown_days)
+            set_kill_until(until)
+            cu_iso = _iso_z(until)
+            rep["cooldown_until"] = cu_iso
 
-        # Após cooldown, manter bloqueado até 2FA
-        st["awaiting_unlock"] = True
-        st["cooldown_until"] = cu_iso
+            # Após cooldown, manter bloqueado até 2FA
+            st["awaiting_unlock"] = True
+            st["cooldown_until"] = cu_iso
 
-        # Modo físico (gancho): aqui você pode acionar integração para desligar AutoTrading
-        if mode.lower() == "physical":
-            # Ex.: enviar sinal para um watcher que desativa AutoTrading no terminal alvo
-            # (mantenho como log para não criar dependência direta)
-            log_event("AUTOTRADING_OFF_REQUEST", {"reason": "DD_TRIPPED"}, context={"module": "dd"})
+            # Modo físico (gancho): aqui você pode acionar integração para desligar AutoTrading
+            if mode.lower() == "physical":
+                # Ex.: enviar sinal para um watcher que desativa AutoTrading no terminal alvo
+                # (mantenho como log para não criar dependência direta)
+                log_event("AUTOTRADING_OFF_REQUEST", {"reason": "DD_TRIPPED"}, context={"module": "dd"})
+        else:
+            # Keep kill active after cooldown while awaiting 2FA
+            if awaiting_unlock and not in_cooldown:
+                ks = kill_status()
+                if not ks.get("active"):
+                    set_kill_until(_now_utc() + timedelta(hours=24))
     else:
         # Cooldown terminou, porém ainda aguardando 2FA → manter kill e limpar cooldown do estado
         if not in_cooldown and awaiting_unlock:

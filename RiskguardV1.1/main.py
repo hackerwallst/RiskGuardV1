@@ -678,7 +678,7 @@ def main():
             if enforce_drawdown is not None and DD_LIMIT_PCT is not None:
                 try:
                     dd_rep = enforce_drawdown(reader, dd_limit_pct=DD_LIMIT_PCT, cooldown_days=DD_COOLDOWN_DAYS)
-                    if dd_rep.get("tripped"):
+                    if dd_rep.get("tripped_now"):
                         _rate_limited_alert("DD KILL", ["💀 DD atingido: conta em cooldown (fechamentos executados)."])
                         log_event("DD_KILL", {"rep": dd_rep}, {"module":"dd"})
                 except Exception as e:

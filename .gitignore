@@ -24,6 +24,10 @@ RiskguardV1.1/reports/*.csv
 RiskguardV1.1/reports/*.png
 RiskguardV1.1/reports/reports/
 
+# Local MT5 exports (root)
+Relatorio*.html
+Relatorio*.png
+
 # Virtual environments
 venv/
 .venv/

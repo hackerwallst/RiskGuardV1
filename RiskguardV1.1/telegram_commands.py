@@ -6,10 +6,12 @@ from pathlib import Path
 import html
 import time
 import unicodedata
+import json
 
 from mt5_reader import RiskGuardMT5Reader
 from notify import send_alert, send_document
 from limits.limits import risk_block_status
+from logger import log_event
 
 try:
     from limits.dd_kill import dd_status
@@ -19,6 +21,30 @@ except Exception:
 
 MAX_POSITIONS = 20
 MAX_HISTORY = 15
+REPORT_STATE_FILE = Path(__file__).resolve().parent / ".rg_report_cmd.json"
+PERTRADE_STATE_FILE = Path(__file__).resolve().parent / ".rg_pertrade_interactive.json"
+REPORT_PENDING_TTL_SEC = 15 * 60
+
+REPORT_CHOICES = {
+    "1": {"label": "Completo", "days": None},
+    "2": {"label": "Anual (últimos 12 meses)", "days": 365},
+    "3": {"label": "Trimestral (últimos 90 dias)", "days": 90},
+    "4": {"label": "Mensal (últimos 30 dias)", "days": 30},
+    "5": {"label": "Quinzenal (últimos 15 dias)", "days": 15},
+}
+
+REPORT_ALIAS = {
+    "completo": "1",
+    "total": "1",
+    "anual": "2",
+    "ano": "2",
+    "trimestral": "3",
+    "trimestre": "3",
+    "mensal": "4",
+    "mes": "4",
+    "quinzenal": "5",
+    "quinzena": "5",
+}
 
 
 def handle_telegram_commands(reader: RiskGuardMT5Reader, messages: List[Dict[str, Any]]) -> int:
@@ -27,9 +53,15 @@ def handle_telegram_commands(reader: RiskGuardMT5Reader, messages: List[Dict[str
         text = (msg.get("text") or "").strip()
         if not text:
             continue
-        if text in ("1", "2"):
-            # Reserved for per-trade interactive decisions.
-            continue
+        if text in ("1", "2", "3", "4", "5"):
+            # Se há escolha pendente de relatório e não conflita com per-trade, consome.
+            if _is_report_pending() and not _pertrade_has_pending():
+                _send_report(reader, [text])
+                handled += 1
+                continue
+            # Caso contrário, mantém reservado para per-trade.
+            if text in ("1", "2"):
+                continue
         cmd, args = _parse_command(text)
         if not cmd:
             continue
@@ -43,7 +75,7 @@ def handle_telegram_commands(reader: RiskGuardMT5Reader, messages: List[Dict[str
             _send_history(reader)
             handled += 1
         elif cmd == "report":
-            _send_report(reader)
+            _send_report(reader, args)
             handled += 1
         elif cmd == "help":
             _send_help()
@@ -135,10 +167,82 @@ def _h(v: Any) -> str:
 
 
 def _period_last_30_days() -> Tuple[datetime, datetime]:
+    return _period_last_days(30)
+
+def _period_last_days(days: int) -> Tuple[datetime, datetime]:
     now = datetime.now(timezone.utc)
     until = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-    since = until - timedelta(days=30)
+    since = until - timedelta(days=int(days))
     return since, until
+
+def _report_menu_lines() -> List[str]:
+    return [
+        "Escolha o período do relatório:",
+        "1 - Completo",
+        "2 - Anual",
+        "3 - Trimestral",
+        "4 - Mensal",
+        "5 - Quinzenal",
+        "",
+        "Responda com /relatorio 1..5",
+    ]
+
+def _load_report_state() -> Dict[str, Any]:
+    try:
+        if REPORT_STATE_FILE.exists():
+            data = json.loads(REPORT_STATE_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {"pending": False, "requested_at": 0.0}
+
+def _save_report_state(state: Dict[str, Any]) -> None:
+    try:
+        REPORT_STATE_FILE.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+def _set_report_pending() -> None:
+    _save_report_state({"pending": True, "requested_at": time.time()})
+
+def _clear_report_pending() -> None:
+    _save_report_state({"pending": False, "requested_at": 0.0})
+
+def _is_report_pending() -> bool:
+    st = _load_report_state()
+    if not st.get("pending"):
+        return False
+    requested_at = float(st.get("requested_at") or 0.0)
+    if requested_at and (time.time() - requested_at) > REPORT_PENDING_TTL_SEC:
+        _clear_report_pending()
+        return False
+    return True
+
+def _pertrade_has_pending() -> bool:
+    try:
+        if not PERTRADE_STATE_FILE.exists():
+            return False
+        data = json.loads(PERTRADE_STATE_FILE.read_text(encoding="utf-8"))
+        tickets = data.get("tickets")
+        if isinstance(tickets, dict):
+            for st in tickets.values():
+                if isinstance(st, dict) and st.get("status") == "pending":
+                    return True
+    except Exception:
+        return False
+    return False
+
+def _parse_report_choice(args: Optional[List[str]]) -> Optional[str]:
+    if not args:
+        return None
+    token = _strip_accents(str(args[0]).strip().lower())
+    if token in REPORT_CHOICES:
+        return token
+    return REPORT_ALIAS.get(token)
 
 
 def _send_status(reader: RiskGuardMT5Reader) -> None:
@@ -209,8 +313,18 @@ def _send_history(reader: RiskGuardMT5Reader) -> None:
     since, until = _period_last_30_days()
     try:
         from reports import reports as reports_mod
-    except Exception:
-        send_alert("HISTORY", ["❌ Módulo de relatórios não encontrado."])
+    except Exception as exc:
+        err = repr(exc)
+        lines = ["❌ Módulo de relatórios indisponível."]
+        if isinstance(exc, ModuleNotFoundError):
+            missing = getattr(exc, "name", None) or "dependência"
+            lines.append(
+                f"Dependência ausente: {missing}. Rode setup_riskguard.ps1 para reinstalar."
+            )
+        else:
+            lines.append(f"Detalhe: {err}")
+        send_alert("HISTORY", lines)
+        log_event("ERROR", {"err": err}, {"module": "reports_import"})
         return
 
     reader.ensure_connection()
@@ -276,13 +390,37 @@ def _find_new_report_pdf(out_dir: Path, since_ts: float) -> Optional[Path]:
     return None
 
 
-def _send_report(reader: RiskGuardMT5Reader) -> None:
-    since, until = _period_last_30_days()
-    send_alert("RELATORIO", ["⏳ Gerando relatório... aguarde."])
+def _send_report(reader: RiskGuardMT5Reader, args: Optional[List[str]] = None) -> None:
+    choice = _parse_report_choice(args)
+    if not choice:
+        _set_report_pending()
+        send_alert("RELATORIO", _report_menu_lines())
+        return
+
+    _clear_report_pending()
+    opt = REPORT_CHOICES.get(choice) or REPORT_CHOICES["4"]
+    days = opt.get("days")
+    if days is None:
+        since = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        _, until = _period_last_days(1)
+    else:
+        since, until = _period_last_days(int(days))
+
+    send_alert("RELATORIO", [f"⏳ Gerando relatório ({opt['label']})... aguarde."])
     try:
         from reports import reports as reports_mod
-    except Exception:
-        send_alert("RELATORIO", ["❌ Módulo de relatórios não encontrado."])
+    except Exception as exc:
+        err = repr(exc)
+        lines = ["❌ Módulo de relatórios indisponível."]
+        if isinstance(exc, ModuleNotFoundError):
+            missing = getattr(exc, "name", None) or "dependência"
+            lines.append(
+                f"Dependência ausente: {missing}. Rode setup_riskguard.ps1 para reinstalar."
+            )
+        else:
+            lines.append(f"Detalhe: {err}")
+        send_alert("RELATORIO", lines)
+        log_event("ERROR", {"err": err}, {"module": "reports_import"})
         return
 
     start_ts = time.time()
@@ -298,7 +436,10 @@ def _send_report(reader: RiskGuardMT5Reader) -> None:
         send_alert("RELATORIO", ["❌ Não consegui gerar o PDF. Verifique o Playwright/Chromium."])
         return
 
-    ok = send_document(str(pdf_path), caption=f"Relatorio completo ({since.date()} -> {until.date()})")
+    ok = send_document(
+        str(pdf_path),
+        caption=f"Relatorio {opt['label']} ({since.date()} -> {until.date()})",
+    )
     if not ok:
         send_alert("RELATORIO", ["❌ Falha ao enviar o PDF pelo Telegram."])
 
@@ -309,6 +450,6 @@ def _send_help() -> None:
         "• /status — status completo da conta",
         "• /positions — posições abertas",
         "• /history — histórico do último mês",
-        "• /relatorio — relatório completo em PDF",
+        "• /relatorio — escolher período do relatório (1..5)",
     ]
     send_alert("AJUDA", lines)

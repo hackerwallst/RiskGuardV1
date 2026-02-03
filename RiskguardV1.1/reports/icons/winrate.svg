@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Win Rate">
+  <circle cx="32" cy="32" r="22" fill="currentColor" opacity="0.18"></circle>
+  <path d="M32 10a22 22 0 0 1 22 22h-4a18 18 0 0 0-18-18V10z" fill="currentColor" opacity="0.45"></path>
+  <path d="M26.5 34.5l-5-5a2 2 0 1 0-2.8 2.8l6.4 6.4a2 2 0 0 0 2.8 0l17-17a2 2 0 1 0-2.8-2.8l-15.6 15.6z" fill="currentColor"></path>
+</svg>

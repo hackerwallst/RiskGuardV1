@@ -342,8 +342,6 @@ class RiskGuardUI(QtWidgets.QMainWindow):
         content_layout.addWidget(self._build_risk_group())
         content_layout.addWidget(self._build_dd_group())
         content_layout.addWidget(self._build_news_group())
-        content_layout.addWidget(self._build_mc_group())
-        content_layout.addWidget(self._build_advanced_group())
         content_layout.addWidget(self._build_status_group())
         content_layout.addStretch(1)
 
@@ -774,48 +772,6 @@ class RiskGuardUI(QtWidgets.QMainWindow):
         self._add_row(card.content_layout, "Filtro Recentes (seg):", self.news_recent)
         return card
 
-    def _build_mc_group(self) -> SectionCard:
-        card = SectionCard("Monte Carlo Simulação", icon_path=ASSETS_DIR / "chart-candlestick.svg", icon_color="#22c55e")
-
-        self.mc_risk = QtWidgets.QDoubleSpinBox()
-        self.mc_risk.setLocale(LOCALE_DOT)
-        self.mc_risk.setRange(0.0001, 100.0)
-        self.mc_risk.setDecimals(4)
-        self.mc_risk.setSuffix(" %")
-        self.mc_risk.setFixedWidth(110)
-
-        self.mc_dd = QtWidgets.QDoubleSpinBox()
-        self.mc_dd.setLocale(LOCALE_DOT)
-        self.mc_dd.setRange(0.01, 100.0)
-        self.mc_dd.setDecimals(2)
-        self.mc_dd.setSuffix(" %")
-        self.mc_dd.setFixedWidth(110)
-
-        self._add_row(card.content_layout, "Risco MC %:", self.mc_risk)
-        self._add_row(card.content_layout, "Limite de MC DD:", self.mc_dd)
-        return card
-
-    def _build_advanced_group(self) -> SectionCard:
-        card = SectionCard("Avançado", icon_path=None, icon_color=None)
-
-        self.loop_seconds = QtWidgets.QDoubleSpinBox()
-        self.loop_seconds.setLocale(LOCALE_DOT)
-        self.loop_seconds.setRange(0.2, 60.0)
-        self.loop_seconds.setDecimals(2)
-        self.loop_seconds.setSuffix(" seg.")
-        self.loop_seconds.setFixedWidth(110)
-
-        self.watch_interval = QtWidgets.QDoubleSpinBox()
-        self.watch_interval.setLocale(LOCALE_DOT)
-        self.watch_interval.setRange(0.1, 10.0)
-        self.watch_interval.setDecimals(2)
-        self.watch_interval.setSuffix(" seg.")
-        self.watch_interval.setFixedWidth(110)
-
-        self._add_row(card.content_layout, "Loop principal:", self.loop_seconds)
-        self._add_row(card.content_layout, "Verificação (seg):", self.watch_interval)
-        return card
-
     def _apply_style(self) -> None:
         self.setStyleSheet(
             """
@@ -998,12 +954,6 @@ class RiskGuardUI(QtWidgets.QMainWindow):
         self.news_window.setValue(_as_int(cfg.get("NEWS_WINDOW_MINUTES"), 60))
         self.news_recent.setValue(_as_int(cfg.get("NEWS_RECENT_SECONDS"), 180))
 
-        self.mc_risk.setValue(_as_float(cfg.get("MC_RISK_PCT"), 0.01))
-        self.mc_dd.setValue(_as_float(cfg.get("MC_DD_LIMIT"), 0.30))
-
-        self.loop_seconds.setValue(_as_float(cfg.get("LOOP_SECONDS"), 2.0))
-        self.watch_interval.setValue(_as_float(cfg.get("LIMITS_WATCH_INTERVAL_SEC"), 0.7))
-
         self.terminal_path.setText(_read_terminal_path())
 
     def _wire_logic(self) -> None:
@@ -1059,7 +1009,6 @@ class RiskGuardUI(QtWidgets.QMainWindow):
             "TELEGRAM_CHAT_ID": self.telegram_chat_id.text().strip(),
             "TELEGRAM_COMMANDS": _fmt_bool(self.telegram_commands.isChecked()),
             "TELEGRAM_COMMANDS_POLL_SECONDS": str(int(self.telegram_poll.value())),
-            "LOOP_SECONDS": _fmt_float(self.loop_seconds.value()),
             "PERTRADE_MAX_RISK": _fmt_float(self.pertrade_max.value()),
             "PERTRADE_INTERACTIVE": _fmt_bool(self.pertrade_interactive.isChecked()),
             "PERTRADE_INTERACTIVE_TIMEOUT_MIN": str(int(self.pertrade_timeout.value())),
@@ -1070,9 +1019,6 @@ class RiskGuardUI(QtWidgets.QMainWindow):
             "NEWS_WINDOW_MINUTES": str(int(self.news_window.value())),
             "NEWS_RECENT_SECONDS": str(int(self.news_recent.value())),
             "NEWS_WINDOW_ENABLED": _fmt_bool(self.news_enabled.isChecked()),
-            "LIMITS_WATCH_INTERVAL_SEC": _fmt_float(self.watch_interval.value()),
-            "MC_RISK_PCT": _fmt_float(self.mc_risk.value()),
-            "MC_DD_LIMIT": _fmt_float(self.mc_dd.value()),
         }
 
         if self.dd_enabled.isChecked():
